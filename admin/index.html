@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Travel Seasons · PoC Admin</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="dot"></span>
+    <strong>Travel Seasons</strong>
+    <span class="muted">· PoC Admin</span>
+  </div>
+  <nav class="tabs">
+    <a href="#users" data-tab="users">Users</a>
+    <a href="#trips" data-tab="trips" class="active">Trips</a>
+  </nav>
+  <div class="meta">
+    <span id="health-pill" class="pill">…</span>
+  </div>
+</header>
+
+<main id="root"></main>
+
+<template id="tpl-users">
+  <section class="page">
+    <h1>Enrolled users</h1>
+    <p class="muted">Add a user with a clear face selfie. Backend extracts a 512-dim face vector and stores it.</p>
+
+    <form id="enroll-form" class="card form-row">
+      <input name="name" placeholder="Full name" required />
+      <input name="email" placeholder="Email (optional)" type="email" />
+      <label class="file-input">
+        <input type="file" name="selfie" accept="image/*" required />
+        <span>Choose selfie…</span>
+      </label>
+      <button type="submit">Enroll</button>
+    </form>
+
+    <div id="users-grid" class="grid users-grid"></div>
+  </section>
+</template>
+
+<template id="tpl-trips">
+  <section class="page">
+    <h1>Trips</h1>
+    <form id="trip-form" class="card form-row">
+      <input name="name" placeholder="Trip name (e.g. Bhutan May 2026)" required />
+      <input name="start_date" type="date" />
+      <input name="end_date" type="date" />
+      <button type="submit">Create trip</button>
+    </form>
+    <div id="trips-list" class="trip-list"></div>
+  </section>
+</template>
+
+<template id="tpl-trip-detail">
+  <section class="page">
+    <a href="#trips" class="back">← All trips</a>
+    <h1 id="td-name">Trip</h1>
+    <div class="meta-row">
+      <span id="td-dates" class="muted"></span>
+      <span id="td-members" class="muted"></span>
+    </div>
+
+    <div id="upload-zone" class="card upload-zone">
+      <p><strong>Drop trip photos here</strong> or click to choose</p>
+      <p class="muted small">Multiple files OK. Backend will detect faces and tag matched users.</p>
+      <input type="file" id="upload-input" accept="image/*" multiple hidden />
+    </div>
+
+    <div id="progress" class="progress" hidden>
+      <div class="progress-bar"><div id="progress-fill"></div></div>
+      <span id="progress-text" class="muted small"></span>
+    </div>
+
+    <div class="filter-row">
+      <label>Filter:
+        <select id="filter-select">
+          <option value="all">All photos</option>
+          <option value="group">Group photos (≥2 matched)</option>
+          <option value="me">Photos of one user…</option>
+        </select>
+      </label>
+      <select id="me-user" hidden></select>
+      <span class="muted small" id="photo-count"></span>
+    </div>
+
+    <div id="photos-grid" class="grid photos-grid"></div>
+  </section>
+</template>
+
+<div id="modal" class="modal" hidden>
+  <div class="modal-card">
+    <button class="modal-close" id="modal-close">×</button>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

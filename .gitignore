@@ -1,0 +1,27 @@
+# Secrets — never commit
+.mcp.json
+.env
+backend/.env
+*.local
+
+# Build / cache
+__pycache__/
+*.pyc
+.dart_tool/
+build/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Backend local data
+backend/data/
+backend/storage_local/
+backend/.venv/
+
+# Flutter
+app/.dart_tool/
+app/build/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
