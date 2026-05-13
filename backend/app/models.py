@@ -24,7 +24,8 @@ class User(SQLModel, table=True):
     name: str
     email: str | None = None
     selfie_path: str | None = None
-    face_embedding: str | None = None  # JSON-encoded list[float], len=512
+    face_embedding: str | None = None  # LEGACY: JSON-encoded list[float], len=512 (facenet era)
+    rekognition_face_id: str | None = None  # AWS Rekognition FaceId
     created_at: datetime = Field(default_factory=_now)
     deleted_at: datetime | None = None
 
@@ -117,8 +118,11 @@ class PhotoFace(SQLModel, table=True):
     photo_id: str = Field(foreign_key="photo.id", index=True)
     user_id: str | None = Field(default=None, foreign_key="user.id", index=True)
     bbox: str  # JSON [x, y, w, h]
-    embedding: str  # JSON list[float]
-    confidence: float | None = None
+    bbox_space: str = Field(default="normalised")  # 'pixel' (legacy) | 'normalised' (new)
+    embedding: str | None = None  # LEGACY nullable since Rekognition migration
+    rekognition_face_id: str | None = Field(default=None, index=True)
+    confidence: float | None = None  # 0-100 for Rekognition rows; 0-1 for legacy facenet rows
     source: str = Field(default="auto")  # auto|manual
     removed: bool = Field(default=False)
+    error: str | None = None  # per-face error e.g. "throttled" | "too_small" | "quality_reject"
     created_at: datetime = Field(default_factory=_now)

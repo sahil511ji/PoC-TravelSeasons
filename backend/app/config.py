@@ -22,8 +22,15 @@ class Settings(BaseSettings):
     LOCAL_DB_PATH: str = "./data/poc.db"
     LOCAL_STORAGE_DIR: str = "./storage_local"
 
-    FACE_MATCH_THRESHOLD: float = 0.40
-    FACE_MODEL: str = "buffalo_s"
+    # Face engine — AWS Rekognition
+    AWS_ACCESS_KEY_ID: str = ""
+    AWS_SECRET_ACCESS_KEY: str = ""
+    AWS_REGION: str = "ap-south-1"
+    AWS_ACCOUNT_ID: str = ""  # optional; if set, lifespan asserts sts identity matches
+    REKOGNITION_COLLECTION_ID: str = "travelseasons-poc"
+    REKOGNITION_FACE_MATCH_THRESHOLD: float = 80.0  # percent 0-100
+    REKOGNITION_QUALITY_FILTER: str = "AUTO"  # NONE | LOW | MEDIUM | HIGH | AUTO
+    ALLOW_COLLECTION_DRIFT: bool = False  # if true, skip face_count vs DB drift check
 
     PUBLIC_BASE_URL: str = "http://localhost:8000"
     CORS_ORIGINS: str = "http://localhost:8000,http://localhost:3000,http://localhost:5173"

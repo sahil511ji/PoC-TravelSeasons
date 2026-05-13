@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-import json
+import asyncio
+import logging
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlmodel import Session
 
 from ..deps import db_session, get_storage
-from ..face.engine import get_engine
+from ..face import get_engine, resize_if_oversized
 from ..models import User
 from ..schemas import UserOut
-from ..tasks.rematch import rematch_unmatched_faces
+from ..tasks.rematch import rematch_unmatched_after_enrol
 
+log = logging.getLogger(__name__)
 router = APIRouter(prefix="/enrollments", tags=["enrollments"])
 
 
@@ -26,24 +28,49 @@ async def create_enrollment(
     image_bytes = await selfie.read()
     if len(image_bytes) == 0:
         raise HTTPException(status_code=400, detail="Empty selfie file")
-    try:
-        embedding = get_engine().embed_single_face(image_bytes)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
 
+    # Pre-resize if needed to fit Rekognition's 5 MB inline limit.
+    image_bytes = await asyncio.to_thread(resize_if_oversized, image_bytes)
+    if len(image_bytes) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Selfie too large even after resize")
+
+    eng = get_engine()
+
+    # Re-enrolment path: if user already has an AWS face_id, delete the old one first.
+    existing = session.get(User, user_id) if user_id else None
+    if existing and existing.rekognition_face_id:
+        try:
+            await asyncio.to_thread(eng.delete_face, existing.rekognition_face_id)
+        except Exception:
+            log.warning("delete_face during re-enrol failed (non-fatal)", exc_info=True)
+        existing.rekognition_face_id = None
+
+    # Build/reuse the User row so we know the user_id to set as ExternalImageId.
     user = None
     if user_id:
-        existing = session.get(User, user_id)
         if existing:
             user = existing
             user.name = name
             user.email = email
-            user.face_embedding = json.dumps(embedding)
         else:
-            user = User(id=user_id, name=name, email=email, face_embedding=json.dumps(embedding))
+            user = User(id=user_id, name=name, email=email)
     if user is None:
-        user = User(name=name, email=email, face_embedding=json.dumps(embedding))
+        user = User(name=name, email=email)
 
+    # Reactivate soft-deleted users on re-enrolment.
+    if user.deleted_at is not None:
+        user.deleted_at = None
+
+    # Index against the Rekognition collection.
+    try:
+        face_id = await asyncio.to_thread(eng.index_selfie, image_bytes, user.id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    user.rekognition_face_id = face_id
+    user.face_embedding = None  # legacy column — kept nullable, not populated
+
+    # Upload selfie to storage for admin thumbnail + future recovery.
     selfie_key = f"selfies/{user.id}.jpg"
     await storage.put(selfie_key, image_bytes, selfie.content_type or "image/jpeg")
     user.selfie_path = selfie_key
@@ -52,8 +79,11 @@ async def create_enrollment(
     session.commit()
     session.refresh(user)
 
-    # Auto-tag any photos already uploaded that contain this user's face.
-    rematch_unmatched_faces(session, only_user=user)
+    # Auto-link previously-unmatched faces to this newly enrolled user.
+    try:
+        await asyncio.to_thread(rematch_unmatched_after_enrol, session, user)
+    except Exception:
+        log.exception("rematch_unmatched_after_enrol failed (non-fatal)")
 
     return UserOut(
         id=user.id,

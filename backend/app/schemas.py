@@ -74,7 +74,9 @@ class FaceOverride(BaseModel):
 class HealthOut(BaseModel):
     ok: bool
     mode: str
-    model: str
+    face_engine: str
+    collection: str
+    collection_face_count: int
     threshold: float
 
 
