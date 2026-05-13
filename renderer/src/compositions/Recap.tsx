@@ -1,9 +1,9 @@
 import React from 'react';
 import { AbsoluteFill, Audio, Sequence, useVideoConfig } from 'remotion';
 import { PhotoScene } from '../scenes/PhotoScene';
-import { TitleOverlay } from '../scenes/TitleOverlay';
 import { IntroCard } from '../scenes/IntroCard';
 import { EndCard } from '../scenes/EndCard';
+import { LiveCaption } from '../scenes/LiveCaption';
 import { theme } from '../theme';
 import { RenderSpec } from '../types';
 
@@ -18,6 +18,8 @@ const MAX_PHOTO_SECONDS = 4.5;
 export const Recap: React.FC<RenderSpec> = ({
   photos,
   voiceoverUrl,
+  wordTimings,
+  voiceoverStartSec,
   musicUrl,
   dayTitle,
   daySubtitle,
@@ -64,41 +66,35 @@ export const Recap: React.FC<RenderSpec> = ({
           />
         </Sequence>
 
-        {/* 2 — Photo sequences with crossfade overlap.
-            Captions only show on the FIRST photo of each unique activity. */}
-        {(() => {
-          const seenActivities = new Set<string>();
-          return kept.map((p, i) => {
-            const start = photosFrom + i * step;
-            const motion = MOTIONS[i % MOTIONS.length];
-            const activityKey = p.title || p.caption || '';
-            const isFirstOfActivity = !!activityKey && !seenActivities.has(activityKey);
-            if (isFirstOfActivity) seenActivities.add(activityKey);
-            // Diary caption is preferred; fall back to title.
-            const overlayText = p.caption || p.title;
-            const showOverlay = isFirstOfActivity && !!overlayText && p.importance >= 7;
-            return (
-              <Sequence
-                key={`photo-${i}`}
-                from={start}
-                durationInFrames={photoSceneFrames}
-                name={`Photo ${i + 1}`}
-              >
-                <PhotoScene src={p.url} motion={motion} />
-                {showOverlay && (
-                  <Sequence
-                    from={Math.round(0.20 * photoSceneFrames)}
-                    durationInFrames={Math.round(0.62 * photoSceneFrames)}
-                  >
-                    <TitleOverlay eyebrow={daySubtitle} title={overlayText!} />
-                  </Sequence>
-                )}
-              </Sequence>
-            );
-          });
-        })()}
+        {/* 2 — Photo sequences with crossfade overlap. */}
+        {kept.map((p, i) => {
+          const start = photosFrom + i * step;
+          const motion = MOTIONS[i % MOTIONS.length];
+          return (
+            <Sequence
+              key={`photo-${i}`}
+              from={start}
+              durationInFrames={photoSceneFrames}
+              name={`Photo ${i + 1}`}
+            >
+              <PhotoScene src={p.url} motion={motion} />
+            </Sequence>
+          );
+        })}
 
-        {/* 3 — End card */}
+        {/* 3 — Live caption layer — only across the photo timeline, not over intro/outro.
+            voiceStartSec is expressed relative to this Sequence's frame=0, so we
+            subtract photosFrom (the offset of the Sequence from composition root). */}
+        {wordTimings && wordTimings.length > 0 && (
+          <Sequence from={photosFrom} durationInFrames={Math.max(1, outroFrom - photosFrom)}>
+            <LiveCaption
+              words={wordTimings}
+              voiceStartSec={(voiceoverStartSec ?? 0.7) - photosFrom / fps}
+            />
+          </Sequence>
+        )}
+
+        {/* 4 — End card */}
         <Sequence from={outroFrom} durationInFrames={outroFrames}>
           <EndCard brandName="Travel Seasons" tagline="Curated · Personal · Yours" />
         </Sequence>

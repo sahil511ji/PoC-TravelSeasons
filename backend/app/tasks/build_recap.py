@@ -83,12 +83,27 @@ async def _run(video_render_id: str) -> None:
         version = vr.version
         script_text = day.voiceover_script or ""
 
-    # ---------- 2. TTS (shared by both engines) ----------
+    # ---------- 2. TTS with word timings (shared by both engines) ----------
     log.info("[recap %s] tts: %d chars (engine=%s)", video_render_id, len(script_text), engine)
-    mp3_bytes = tts.synthesize(script_text)
+    mp3_bytes, word_timings = tts.synthesize_with_timing(script_text)
     voiceover_key = f"voiceovers/{day.id}/v{version}.mp3"
     await storage.put(voiceover_key, mp3_bytes, "audio/mpeg")
     voiceover_url = storage.public_url(voiceover_key)
+
+    # Save timing.json alongside the MP3 (used by LiveCaption in Remotion).
+    timing_url: str | None = None
+    if word_timings:
+        import json
+        timing_key = f"voiceovers/{day.id}/v{version}_timing.json"
+        timing_payload = json.dumps([w.to_dict() for w in word_timings]).encode("utf-8")
+        await storage.put(timing_key, timing_payload, "application/json")
+        timing_url = storage.public_url(timing_key)
+        log.info(
+            "[recap %s] saved %d word-timings at %s",
+            video_render_id, len(word_timings), timing_url,
+        )
+    else:
+        log.info("[recap %s] no word timings (TTS endpoint unavailable); captions disabled", video_render_id)
 
     # Probe voiceover duration so the video matches the audio length.
     voice_secs = audio_probe.mp3_duration_seconds(mp3_bytes) or TARGET_SECONDS
@@ -118,6 +133,7 @@ async def _run(video_render_id: str) -> None:
             photos=photos,
             photos_by_item=photos_by_item,
             voiceover_url=voiceover_url,
+            timing_url=timing_url,
             voice_secs=voice_secs,
             storage=storage,
         )
@@ -177,7 +193,7 @@ async def _render_via_shotstack(
 
 async def _render_via_remotion(
     *, video_render_id, day, items, photos, photos_by_item, voiceover_url,
-    voice_secs: float, storage
+    timing_url: str | None, voice_secs: float, storage
 ) -> bytes:
     """Remotion pipeline: POST spec to Node renderer → receive MP4 bytes."""
     item_by_id = {i.id: i for i in items}
@@ -219,9 +235,11 @@ async def _render_via_remotion(
         "daySubtitle": day.date.isoformat(),
         "photos": photo_specs,
         "voiceoverUrl": voiceover_url,
+        "timingUrl": timing_url,                 # may be None if TTS endpoint unavailable
+        "voiceoverStartSec": 0.7,                # voice begins after intro lifts
         "musicUrl": DEFAULT_MUSIC_URL,
         "targetSeconds": total_sec,
-        "voiceoverDurationSec": total_sec,   # Recap uses this to size durationInFrames
+        "voiceoverDurationSec": total_sec,
         "fps": 30,
         "width": 1280,
         "height": 720,

@@ -32,7 +32,7 @@ def is_available(timeout: float = 2.0) -> bool:
         return False
 
 
-def render(spec: dict, timeout: float = 600.0) -> bytes:
+def render(spec: dict, timeout: float = 1200.0) -> bytes:
     """POST the render spec to the Node service, return MP4 bytes.
 
     Raises RemotionError on non-200 or empty response.

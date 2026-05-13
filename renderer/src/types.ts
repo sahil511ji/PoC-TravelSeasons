@@ -12,6 +12,9 @@ export interface RenderSpec {
 
   photos: PhotoSpec[];
   voiceoverUrl: string;
+  timingUrl?: string;              // URL to word-timing JSON (pre-fetched server-side)
+  wordTimings?: { word: string; start: number; end: number }[]; // inlined by render.ts
+  voiceoverStartSec?: number;      // seconds the voice MP3 begins after frame 0 (default 0.7)
   musicUrl?: string;
 
   targetSeconds: number;

@@ -43,6 +43,17 @@ export async function renderRecap(spec: RenderSpec): Promise<string> {
   return withMutex(async () => {
     const bundled = await getBundle();
 
+    // Pre-fetch word timings ONCE in Node before bundling into Chromium tabs.
+    // Otherwise every parallel tab refetches independently, killing render speed.
+    if (spec.timingUrl && !spec.wordTimings) {
+      try {
+        const res = await fetch(spec.timingUrl);
+        if (res.ok) spec.wordTimings = await res.json();
+      } catch (e) {
+        console.warn('[render] timing.json fetch failed, captions disabled:', (e as Error).message);
+      }
+    }
+
     const totalSeconds = spec.voiceoverDurationSec ?? spec.targetSeconds ?? 30;
     const durationInFrames = Math.max(1, Math.round(totalSeconds * spec.fps));
 
@@ -71,7 +82,14 @@ export async function renderRecap(spec: RenderSpec): Promise<string> {
       codec: 'h264',
       outputLocation: outPath,
       inputProps: spec as unknown as Record<string, unknown>,
-      chromiumOptions: { headless: true },
+      // gl: 'angle' = DirectX 11 GPU rasterization (uses the RTX 3050).
+      // Without this, Chromium falls back to SwiftShader (CPU software) and
+      // CSS blur / backdrop-filter is 5-20x slower.
+      chromiumOptions: { headless: true, gl: 'angle' },
+      concurrency: '50%',
+      hardwareAcceleration: 'if-possible',
+      jpegQuality: 75,
+      timeoutInMilliseconds: 90000,
       onProgress: ({ progress }) => {
         const pct = Math.round(progress * 100);
         if (pct % 20 === 0) console.log(`[render] ${spec.videoRenderId} ${pct}%`);
