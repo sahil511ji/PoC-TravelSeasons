@@ -6,6 +6,7 @@ import 'package:http/http.dart' as http;
 
 import '../models/photo.dart';
 import '../models/trip.dart';
+import '../models/trip_day.dart';
 import '../models/user.dart';
 
 class ApiException implements Exception {
@@ -82,6 +83,19 @@ class ApiClient {
     _check(r);
     final data = jsonDecode(r.body) as List;
     return data.map((j) => Photo.fromJson(j as Map<String, dynamic>)).toList();
+  }
+
+  Future<List<TripDaySummary>> listTripDays(String tripId) async {
+    final r = await http.get(Uri.parse('$baseUrl/trips/$tripId/days'));
+    _check(r);
+    final data = jsonDecode(r.body) as List;
+    return data.map((j) => TripDaySummary.fromJson(j as Map<String, dynamic>)).toList();
+  }
+
+  Future<TripDay> getTripDay(String dayId) async {
+    final r = await http.get(Uri.parse('$baseUrl/trip-days/$dayId'));
+    _check(r);
+    return TripDay.fromJson(jsonDecode(r.body) as Map<String, dynamic>);
   }
 
   void _check(http.Response r) {

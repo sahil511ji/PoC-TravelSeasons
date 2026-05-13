@@ -16,6 +16,7 @@
   <nav class="tabs">
     <a href="#users" data-tab="users">Users</a>
     <a href="#trips" data-tab="trips" class="active">Trips</a>
+    <a href="#videos" data-tab="videos">Videos</a>
   </nav>
   <div class="meta">
     <span id="health-pill" class="pill">…</span>
@@ -58,37 +59,157 @@
 
 <template id="tpl-trip-detail">
   <section class="page">
-    <a href="#trips" class="back">← All trips</a>
+    <div class="crumbs"><a href="#trips">Trips</a> <span>›</span> <span id="td-crumb">Trip</span></div>
     <h1 id="td-name">Trip</h1>
     <div class="meta-row">
       <span id="td-dates" class="muted"></span>
       <span id="td-members" class="muted"></span>
     </div>
 
-    <div id="upload-zone" class="card upload-zone">
-      <p><strong>Drop trip photos here</strong> or click to choose</p>
-      <p class="muted small">Multiple files OK. Backend will detect faces and tag matched users.</p>
-      <input type="file" id="upload-input" accept="image/*" multiple hidden />
+    <!-- SECTION 1: Days & itinerary -->
+    <div class="section">
+      <div class="section-header">
+        <h2>1 · Days &amp; itinerary</h2>
+        <button id="td-add-day-toggle" class="link">+ Add a day</button>
+      </div>
+      <p class="muted small">Trip days, parsed by AI from the Tour Manager's free-form day plan. Each day groups photos by activity using EXIF timestamps, and is the unit a recap video is built from.</p>
+
+      <div id="days-list" style="margin-top:12px;"></div>
+
+      <form id="day-form" class="card add-day-form" hidden>
+        <label class="field">
+          <span>Day date</span>
+          <input name="date" type="date" required />
+        </label>
+        <label class="field">
+          <span>Theme <span class="muted small">(optional, AI fills if blank)</span></span>
+          <input name="theme" placeholder="e.g. Old & New Singapore" />
+        </label>
+        <label class="field">
+          <span>Tour Manager <span class="muted small">(optional)</span></span>
+          <input name="tour_manager" placeholder="e.g. Lakshmi" />
+        </label>
+        <label class="field">
+          <span>Day plan (paste from TM)</span>
+          <textarea name="raw_text" rows="7" placeholder="Paste the day's plan. Free-form is fine. Include rough times. Gemini will structure it."></textarea>
+        </label>
+        <div class="form-actions">
+          <button type="button" id="day-form-cancel" class="ghost">Cancel</button>
+          <button type="submit">Parse with AI</button>
+        </div>
+      </form>
     </div>
 
-    <div id="progress" class="progress" hidden>
-      <div class="progress-bar"><div id="progress-fill"></div></div>
-      <span id="progress-text" class="muted small"></span>
+    <!-- SECTION 2: Photo upload -->
+    <div class="section">
+      <div class="section-header">
+        <h2>2 · Trip photos</h2>
+        <span class="muted small" id="photo-count"></span>
+      </div>
+      <p class="muted small">Bulk-upload group/candid photos taken during the trip. Backend reads EXIF time and slots each photo into the matching day's activity. Faces are also matched to enrolled users.</p>
+
+      <div id="upload-zone" class="card upload-zone">
+        <p><strong>Drop trip photos here</strong> or click to choose</p>
+        <p class="muted small">Multiple files OK</p>
+        <input type="file" id="upload-input" accept="image/*" multiple hidden />
+      </div>
+
+      <div id="progress" class="progress" hidden>
+        <div class="progress-bar"><div id="progress-fill"></div></div>
+        <span id="progress-text" class="muted small"></span>
+      </div>
+
+      <div class="filter-row" style="margin-top:14px;">
+        <label>Filter:
+          <select id="filter-select">
+            <option value="all">All photos</option>
+            <option value="group">Group photos (≥2 matched)</option>
+            <option value="me">Photos of one user…</option>
+          </select>
+        </label>
+        <select id="me-user" hidden></select>
+      </div>
+
+      <div id="photos-grid" class="grid photos-grid"></div>
+    </div>
+  </section>
+</template>
+
+<template id="tpl-trip-day">
+  <section class="page">
+    <div class="crumbs">
+      <a href="#trips">Trips</a> <span>›</span>
+      <a href="#" id="tday-trip-crumb">Trip</a> <span>›</span>
+      <span id="tday-day-crumb">Day</span>
+    </div>
+    <h1 id="tday-title">Day</h1>
+    <div class="meta-row">
+      <span id="tday-meta" class="muted"></span>
     </div>
 
+    <!-- 1 · Itinerary -->
+    <div class="section">
+      <div class="section-header"><h2>1 · Itinerary</h2></div>
+      <p class="muted small">Activities extracted by Gemini from the day plan. Importance scores drive how much each activity weighs in the recap video.</p>
+      <table id="tday-items" class="data-table">
+        <thead>
+          <tr>
+            <th>Time</th><th>Activity</th><th>Importance</th><th class="num">Photos</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <!-- 2 · Voiceover script -->
+    <div class="section">
+      <div class="section-header"><h2>2 · Voiceover script</h2></div>
+      <p class="muted small">AI-generated. Edit it to taste before generating the video. Read the script aloud — it should sound like 30 seconds at gentle pace.</p>
+      <textarea id="tday-script" rows="6" class="textarea-clean"></textarea>
+      <div class="form-actions" style="margin-top:8px;">
+        <span class="muted small" id="tday-script-status"></span>
+        <button id="tday-save-script" class="ghost">Save script</button>
+      </div>
+    </div>
+
+    <!-- 3 · Recap video -->
+    <div class="section">
+      <div class="section-header">
+        <h2>3 · Recap video</h2>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <label class="muted small" style="display:flex;align-items:center;gap:6px;">
+            Engine:
+            <select id="tday-engine">
+              <option value="remotion" selected>Remotion (high-quality)</option>
+              <option value="shotstack">Shotstack</option>
+            </select>
+          </label>
+          <button id="tday-generate-recap" class="primary">▶ Generate recap video</button>
+        </div>
+      </div>
+      <p class="muted small">Pipeline: ElevenLabs voiceover → chosen engine renders MP4 → ready to review. Remotion ≈ 60s local; Shotstack ≈ 35s cloud.</p>
+      <div id="tday-renders" style="margin-top:8px;">No renders yet.</div>
+    </div>
+  </section>
+</template>
+
+<template id="tpl-videos">
+  <section class="page">
+    <h1>Video reviews</h1>
+    <p class="muted">All AI-generated recap videos across trips. Approve to publish to customers, reject to take down.</p>
     <div class="filter-row">
-      <label>Filter:
-        <select id="filter-select">
-          <option value="all">All photos</option>
-          <option value="group">Group photos (≥2 matched)</option>
-          <option value="me">Photos of one user…</option>
+      <label>Show:
+        <select id="videos-filter">
+          <option value="all">All</option>
+          <option value="pending_review" selected>Pending review</option>
+          <option value="approved">Approved</option>
+          <option value="rejected">Rejected</option>
+          <option value="failed">Failed</option>
         </select>
       </label>
-      <select id="me-user" hidden></select>
-      <span class="muted small" id="photo-count"></span>
+      <span class="muted small" id="videos-count"></span>
     </div>
-
-    <div id="photos-grid" class="grid photos-grid"></div>
+    <div id="videos-list"></div>
   </section>
 </template>
 

@@ -5,13 +5,17 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+# Load .env so os.environ has the keys for service wrappers that don't go through Settings.
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
+
 from .config import get_settings
 from .db import init_db
-from .routers import admin_pages, enrollments, photos, trips, users
+from .routers import admin_pages, enrollments, photos, trip_days, trips, users, videos
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("ts")
@@ -42,6 +46,8 @@ app.include_router(enrollments.router)
 app.include_router(users.router)
 app.include_router(trips.router)
 app.include_router(photos.router)
+app.include_router(trip_days.router)
+app.include_router(videos.router)
 
 # Static mounts
 ROOT = Path(__file__).resolve().parent.parent  # backend/

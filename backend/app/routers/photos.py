@@ -18,6 +18,7 @@ from sqlmodel import Session, select
 from ..deps import db_session, get_storage, x_user_id
 from ..models import Photo, PhotoFace, Trip, User
 from ..schemas import FaceOverride, FaceTagOut, PhotoOut, PhotoStatusOut
+from ..services.exif import match_to_itinerary, read_taken_at
 from ..tasks.process_photos import schedule_photo_processing
 
 router = APIRouter(tags=["photos"])
@@ -43,7 +44,20 @@ async def upload_photos(
         photo_id = str(uuid.uuid4())
         key = f"trip_photos/{trip_id}/{photo_id}.jpg"
         await storage.put(key, data, upload.content_type or "image/jpeg")
-        photo = Photo(id=photo_id, trip_id=trip_id, storage_path=key, status="pending")
+
+        taken_at = read_taken_at(data)
+        itinerary_item_id = (
+            match_to_itinerary(session, trip_id=trip_id, taken_at=taken_at) if taken_at else None
+        )
+
+        photo = Photo(
+            id=photo_id,
+            trip_id=trip_id,
+            storage_path=key,
+            status="pending",
+            taken_at=taken_at,
+            itinerary_item_id=itinerary_item_id,
+        )
         session.add(photo)
         session.commit()
         schedule_photo_processing(background, photo_id)
@@ -77,6 +91,8 @@ def _photo_to_out(photo: Photo, faces: list[PhotoFace], users_by_id: dict[str, U
         width=photo.width,
         height=photo.height,
         uploaded_at=photo.uploaded_at,
+        taken_at=photo.taken_at,
+        itinerary_item_id=photo.itinerary_item_id,
         faces=face_outs,
     )
 

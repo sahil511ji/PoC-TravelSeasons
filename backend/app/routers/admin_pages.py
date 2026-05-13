@@ -7,6 +7,7 @@ from sqlmodel import Session
 from ..config import get_settings
 from ..deps import db_session
 from ..schemas import HealthOut
+from ..services import remotion
 from ..tasks.rematch import rematch_unmatched_faces
 
 router = APIRouter(tags=["meta"])
@@ -38,3 +39,10 @@ def rematch_all(session: Session = Depends(db_session)):
     """Re-runs matching on all unmatched, non-removed face rows."""
     tagged = rematch_unmatched_faces(session)
     return {"newly_tagged": tagged}
+
+
+@router.get("/health/renderer")
+def renderer_health():
+    """Probe the Remotion renderer service."""
+    available = remotion.is_available()
+    return {"renderer_available": available, "engine": "remotion"}

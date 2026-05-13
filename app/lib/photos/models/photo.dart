@@ -34,6 +34,8 @@ class Photo {
   final int? width;
   final int? height;
   final String uploadedAt;
+  final String? takenAt;
+  final String? itineraryItemId;
   final List<FaceTag> faces;
 
   Photo({
@@ -43,6 +45,8 @@ class Photo {
     this.width,
     this.height,
     required this.uploadedAt,
+    this.takenAt,
+    this.itineraryItemId,
     required this.faces,
   });
 
@@ -53,6 +57,8 @@ class Photo {
         width: (j['width'] as num?)?.toInt(),
         height: (j['height'] as num?)?.toInt(),
         uploadedAt: j['uploaded_at'] as String,
+        takenAt: j['taken_at'] as String?,
+        itineraryItemId: j['itinerary_item_id'] as String?,
         faces: ((j['faces'] as List?) ?? [])
             .map((f) => FaceTag.fromJson(f as Map<String, dynamic>))
             .toList(),

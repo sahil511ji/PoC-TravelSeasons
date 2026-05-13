@@ -6,6 +6,7 @@ import '../models/trip.dart';
 import '../services/api_client.dart';
 import '../services/identity.dart';
 import 'selfie_enrollment_screen.dart';
+import 'trip_day_screen.dart';
 import 'trip_gallery_screen.dart';
 
 class PhotoGalleriesScreen extends StatefulWidget {
@@ -155,9 +156,16 @@ class _PhotoGalleriesScreenState extends State<PhotoGalleriesScreen> {
       child: InkWell(
         borderRadius: BorderRadius.circular(16),
         onTap: () async {
-          await Navigator.of(context).push(MaterialPageRoute(
-            builder: (_) => TripGalleryScreen(trip: trip),
-          ));
+          // Prefer the day-aware view if the trip has any trip_days. Fallback
+          // to the flat gallery for trips without itinerary entered.
+          final days = await ApiClient.instance.listTripDays(trip.id);
+          if (!mounted) return;
+          final route = MaterialPageRoute(
+            builder: (_) => days.isEmpty
+                ? TripGalleryScreen(trip: trip)
+                : TripDayScreen(trip: trip, days: days),
+          );
+          await Navigator.of(context).push(route);
           if (mounted) _bootstrap();
         },
         child: Container(

@@ -40,8 +40,11 @@ async function route() {
   const hash = location.hash || '#trips';
   if (hash === '#users') { setActiveTab('users'); await renderUsers(); return; }
   if (hash === '#trips') { setActiveTab('trips'); await renderTrips(); return; }
+  if (hash === '#videos') { setActiveTab('videos'); await renderVideos(); return; }
   const m = hash.match(/^#trip\/(.+)$/);
   if (m) { setActiveTab('trips'); await renderTripDetail(m[1]); return; }
+  const md = hash.match(/^#trip-day\/(.+)$/);
+  if (md) { setActiveTab('trips'); await renderTripDay(md[1]); return; }
   location.hash = '#trips';
 }
 window.addEventListener('hashchange', route);
@@ -198,8 +201,20 @@ async function renderTripDetail(tripId) {
   const trip = trips.find(t => t.id === tripId);
   if (!trip) { location.hash = '#trips'; return; }
   document.getElementById('td-name').textContent = trip.name;
+  document.getElementById('td-crumb').textContent = trip.name;
   document.getElementById('td-dates').textContent = `${fmtDate(trip.start_date)} – ${fmtDate(trip.end_date)}`;
   document.getElementById('td-members').textContent = `Members: ${trip.members.map(m => m.name).join(', ') || '—'}`;
+
+  // Toggle "Add a day" form
+  const dayFormEl = document.getElementById('day-form');
+  document.getElementById('td-add-day-toggle').addEventListener('click', () => {
+    dayFormEl.hidden = !dayFormEl.hidden;
+    if (!dayFormEl.hidden) dayFormEl.querySelector('input[name=date]').focus();
+  });
+  document.getElementById('day-form-cancel').addEventListener('click', () => {
+    dayFormEl.hidden = true;
+    dayFormEl.reset();
+  });
 
   const users = await api('/users');
   const meSelect = document.getElementById('me-user');
@@ -225,9 +240,70 @@ async function renderTripDetail(tripId) {
   zone.addEventListener('drop', e => uploadFiles(e.dataTransfer.files));
   input.addEventListener('change', () => uploadFiles(input.files));
 
+  // Days form + list
+  const dayForm = document.getElementById('day-form');
+  const daysList = document.getElementById('days-list');
+  dayForm.addEventListener('submit', async e => {
+    e.preventDefault();
+    const btn = dayForm.querySelector('button[type=submit]');
+    btn.disabled = true; btn.textContent = 'Parsing with AI…';
+    try {
+      const fd = new FormData(dayForm);
+      const body = {
+        date: fd.get('date'),
+        raw_text: fd.get('raw_text'),
+        theme: fd.get('theme') || null,
+        tour_manager: fd.get('tour_manager') || null,
+      };
+      await api(`/trips/${tripId}/days`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      dayForm.reset();
+      dayForm.hidden = true;
+      await loadDaysList(tripId, daysList);
+    } catch (err) {
+      alert('Day parse failed: ' + err.message);
+    } finally {
+      btn.disabled = false; btn.textContent = 'Parse with AI';
+    }
+  });
+  await loadDaysList(tripId, daysList);
+
   await loadPhotos();
   startPolling();
 }
+
+async function loadDaysList(tripId, list) {
+  const days = await api(`/trips/${tripId}/days`);
+  if (!days.length) {
+    list.innerHTML = '<div class="muted small" style="padding:8px 0;">No days yet. Click <strong>+ Add a day</strong> above to paste the day plan.</div>';
+    return;
+  }
+  list.innerHTML = days.map(d => `
+    <div class="trip-row" style="margin-bottom:8px;">
+      <a href="#trip-day/${d.id}" style="display:flex;align-items:center;gap:12px;flex:1;text-decoration:none;color:inherit;">
+        <div class="name">${fmtDate(d.date)} · ${escapeHtml(d.theme || 'Day')}</div>
+        <span class="muted">${d.photo_count} photo${d.photo_count !== 1 ? 's' : ''}</span>
+        <span class="pill ${d.has_approved_video ? 'ok' : ''}">
+          ${d.has_approved_video ? '✓ video published' : 'no video yet'}
+        </span>
+      </a>
+      <button onclick="deleteDay('${d.id}','${escapeHtml(d.theme || 'this day')}','${tripId}')"
+        class="day-del" title="Delete day">×</button>
+    </div>
+  `).join('');
+}
+
+window.deleteDay = async (dayId, dayName, tripId) => {
+  if (!confirm(`Delete "${dayName}"?\n\nThis removes the itinerary + voiceover script + any rendered videos for the day. Photos stay (they become un-linked).`)) return;
+  try {
+    await api(`/trip-days/${dayId}`, { method: 'DELETE' });
+    const list = document.getElementById('days-list');
+    if (list) await loadDaysList(tripId, list);
+  } catch (err) { alert('Delete failed: ' + err.message); }
+};
 
 async function uploadFiles(fileList) {
   const files = Array.from(fileList).filter(f => f.type.startsWith('image/'));
@@ -366,6 +442,216 @@ function renderModalBody(photo, users) {
     await loadPhotos();
   });
 }
+
+// ---------- trip day ----------
+let tripDayPollTimer = null;
+
+async function renderTripDay(dayId) {
+  root.innerHTML = '';
+  root.appendChild(tpl('tpl-trip-day'));
+  if (tripDayPollTimer) clearInterval(tripDayPollTimer);
+
+  const data = await api(`/trip-days/${dayId}`);
+  const trips = await api('/trips');
+  const trip = trips.find(t => t.id === data.trip_id);
+  const tripName = trip ? trip.name : 'Trip';
+
+  document.getElementById('tday-trip-crumb').href = `#trip/${data.trip_id}`;
+  document.getElementById('tday-trip-crumb').textContent = tripName;
+  document.getElementById('tday-day-crumb').textContent = `${fmtDate(data.date)} · ${data.theme || 'Day'}`;
+  document.getElementById('tday-title').textContent = data.theme || `Day · ${fmtDate(data.date)}`;
+  document.getElementById('tday-meta').textContent =
+    [fmtDate(data.date), data.tour_manager && `TM ${data.tour_manager}`, data.weather]
+      .filter(Boolean).join(' · ');
+
+  const scriptArea = document.getElementById('tday-script');
+  scriptArea.value = data.voiceover_script || '';
+
+  document.getElementById('tday-save-script').addEventListener('click', async () => {
+    const btn = document.getElementById('tday-save-script');
+    btn.disabled = true; btn.textContent = 'Saving…';
+    try {
+      await api(`/trip-days/${dayId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ voiceover_script: scriptArea.value }),
+      });
+      document.getElementById('tday-script-status').textContent = 'Saved.';
+      setTimeout(() => { document.getElementById('tday-script-status').textContent = ''; }, 2000);
+    } catch (err) { alert('Save failed: ' + err.message); }
+    finally { btn.disabled = false; btn.textContent = 'Save script'; }
+  });
+
+  // Disable Remotion option if renderer offline
+  try {
+    const rh = await api('/health/renderer');
+    const remoOpt = document.querySelector('#tday-engine option[value="remotion"]');
+    if (remoOpt && !rh.renderer_available) {
+      remoOpt.textContent = 'Remotion (offline — start renderer)';
+      remoOpt.disabled = true;
+      // Auto-fallback to shotstack if remotion was default
+      const sel = document.getElementById('tday-engine');
+      if (sel.value === 'remotion') sel.value = 'shotstack';
+    }
+  } catch (_) {}
+
+  document.getElementById('tday-generate-recap').addEventListener('click', async () => {
+    const btn = document.getElementById('tday-generate-recap');
+    const engine = document.getElementById('tday-engine').value;
+    btn.disabled = true; btn.textContent = `Queued (${engine})…`;
+    try {
+      await api(`/trip-days/${dayId}/generate-recap`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ renderer: engine }),
+      });
+      await loadRenderHistory(dayId);
+      startRenderPolling(dayId);
+    } catch (err) { alert('Generate failed: ' + err.message); }
+    finally { btn.disabled = false; btn.textContent = '▶ Generate recap video'; }
+  });
+
+  // Items table
+  const tbody = document.querySelector('#tday-items tbody');
+  if (!data.items.length) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty">No items yet.</td></tr>';
+  } else {
+    tbody.innerHTML = data.items.map(it => `
+      <tr>
+        <td class="muted small" style="white-space:nowrap;">${(it.start_time||'?').slice(0,5)} – ${(it.end_time||'?').slice(0,5)}</td>
+        <td>
+          <strong>${escapeHtml(it.title)}</strong>
+          ${it.description ? `<div class="muted small" style="margin-top:2px;">${escapeHtml(it.description)}</div>` : ''}
+        </td>
+        <td><span class="muted small">${it.importance}/10</span> ${'★'.repeat(Math.min(5, Math.round(it.importance / 2)))}</td>
+        <td class="num">${it.photo_count}</td>
+      </tr>
+    `).join('');
+  }
+
+  await loadRenderHistory(dayId);
+  // If there's a render in flight, start polling
+  if (data.latest_video && ['queued','rendering'].includes(data.latest_video.status)) {
+    startRenderPolling(dayId);
+  }
+}
+
+async function loadRenderHistory(dayId) {
+  const renders = await api(`/video-renders`);
+  const mine = renders.filter(r => r.trip_day_id === dayId);
+  const el = document.getElementById('tday-renders');
+  if (!mine.length) { el.innerHTML = '<div class="muted small">No renders yet.</div>'; return; }
+  el.innerHTML = mine.map(r => `
+    <div class="card" style="margin-bottom:10px;padding:12px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;">
+        <div>
+          <strong>v${r.version}</strong>
+          <span class="pill ${statusPillClass(r.status)}" style="margin-left:8px;">${r.status.replace('_',' ')}</span>
+          <span class="pill" style="margin-left:6px;background:var(--muted-bg);">${r.engine || 'shotstack'}</span>
+          <div class="muted small" style="margin-top:4px;">${new Date(r.created_at).toLocaleString()}</div>
+        </div>
+        ${r.mp4_url ? `<video src="${r.mp4_url}" controls style="max-width:240px;border-radius:8px;"></video>` : ''}
+      </div>
+      ${r.status === 'pending_review' ? `
+        <div style="margin-top:10px;display:flex;gap:8px;">
+          <button onclick="approveVideo('${r.id}','${dayId}')">Approve</button>
+          <button onclick="rejectVideo('${r.id}','${dayId}')" style="background:var(--red);">Reject</button>
+        </div>` : ''}
+    </div>
+  `).join('');
+}
+
+function statusPillClass(status) {
+  if (status === 'approved') return 'ok';
+  if (status === 'failed' || status === 'rejected') return 'err';
+  return '';
+}
+
+function startRenderPolling(dayId) {
+  if (tripDayPollTimer) clearInterval(tripDayPollTimer);
+  tripDayPollTimer = setInterval(async () => {
+    try {
+      await loadRenderHistory(dayId);
+      const renders = await api(`/video-renders`);
+      const mine = renders.filter(r => r.trip_day_id === dayId);
+      const inFlight = mine.some(r => ['queued','rendering'].includes(r.status));
+      if (!inFlight) {
+        clearInterval(tripDayPollTimer);
+        tripDayPollTimer = null;
+      }
+    } catch (_) {}
+  }, 5000);
+}
+
+window.approveVideo = async (renderId, dayId) => {
+  await api(`/video-renders/${renderId}/approve`, { method: 'POST' });
+  await loadRenderHistory(dayId);
+};
+window.rejectVideo = async (renderId, dayId) => {
+  await api(`/video-renders/${renderId}/reject`, { method: 'POST' });
+  await loadRenderHistory(dayId);
+};
+
+// ---------- videos section ----------
+let _videosCache = null;
+
+async function renderVideos() {
+  root.innerHTML = '';
+  root.appendChild(tpl('tpl-videos'));
+  _videosCache = await api('/video-renders');
+  const select = document.getElementById('videos-filter');
+  select.addEventListener('change', () => drawVideos(select.value));
+  drawVideos(select.value);
+}
+
+function drawVideos(filter) {
+  const list = document.getElementById('videos-list');
+  const count = document.getElementById('videos-count');
+  let rows = _videosCache || [];
+  if (filter !== 'all') rows = rows.filter(r => r.status === filter);
+  count.textContent = `${rows.length} of ${(_videosCache||[]).length} videos`;
+  if (!rows.length) {
+    list.innerHTML = `<div class="empty">No videos in this filter.</div>`;
+    return;
+  }
+  list.innerHTML = rows.map(r => `
+    <div class="card" style="margin-bottom:12px;">
+      <div style="display:flex;gap:16px;align-items:flex-start;">
+        <div style="flex:1;">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap;">
+            <strong>v${r.version}</strong>
+            <span class="pill ${statusPillClass(r.status)}">${r.status.replace('_',' ')}</span>
+            <span class="pill" style="background:var(--muted-bg);">${r.engine || 'shotstack'}</span>
+          </div>
+          <div class="muted small">trip-day ${r.trip_day_id.slice(0,8)}… · ${new Date(r.created_at).toLocaleString()}</div>
+          ${r.admin_notes ? `<div class="muted small" style="margin-top:6px;">${escapeHtml(r.admin_notes)}</div>` : ''}
+          <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;">
+            ${r.status === 'pending_review' ? `
+              <button onclick="approveVideoTop('${r.id}')">Approve</button>
+              <button onclick="rejectVideoTop('${r.id}')" style="background:var(--red);">Reject</button>
+            ` : ''}
+            ${r.status === 'approved' ? `
+              <button onclick="rejectVideoTop('${r.id}')" class="ghost" style="background:white;color:var(--red);border:1px solid var(--border);">Unpublish</button>
+            ` : ''}
+            <a href="#trip-day/${r.trip_day_id}" class="link" style="padding:8px 14px;text-decoration:none;color:var(--brand);font-weight:600;">Open day →</a>
+          </div>
+        </div>
+        ${r.mp4_url ? `<video src="${r.mp4_url}" controls preload="metadata" style="max-width:320px;border-radius:8px;"></video>` : '<div class="muted small">(no mp4 yet)</div>'}
+      </div>
+    </div>
+  `).join('');
+}
+
+window.approveVideoTop = async (renderId) => {
+  await api(`/video-renders/${renderId}/approve`, { method: 'POST' });
+  _videosCache = await api('/video-renders');
+  drawVideos(document.getElementById('videos-filter').value);
+};
+window.rejectVideoTop = async (renderId) => {
+  await api(`/video-renders/${renderId}/reject`, { method: 'POST' });
+  _videosCache = await api('/video-renders');
+  drawVideos(document.getElementById('videos-filter').value);
+};
 
 // ---------- boot ----------
 refreshHealth();
