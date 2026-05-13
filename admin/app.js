@@ -345,6 +345,8 @@ function startPolling() {
   }, 2000);
 }
 
+const _selectedPhotos = new Set();
+
 async function loadPhotos() {
   const tripId = tripDetailState.tripId;
   if (!tripId) return;
@@ -362,10 +364,16 @@ async function loadPhotos() {
 
   if (!photos.length) {
     grid.innerHTML = '<div class="empty">No photos in this view yet.</div>';
+    updateSelectionBar();
     return;
   }
+  // Drop selections for photos no longer in view
+  const visibleIds = new Set(photos.map(p => p.id));
+  for (const id of Array.from(_selectedPhotos)) if (!visibleIds.has(id)) _selectedPhotos.delete(id);
+
   grid.innerHTML = photos.map(p => `
-    <div class="photo-cell" data-photo='${escapeHtml(JSON.stringify(p))}'>
+    <div class="photo-cell ${_selectedPhotos.has(p.id) ? 'selected' : ''}" data-photo-id="${p.id}" data-photo='${escapeHtml(JSON.stringify(p))}'>
+      <input type="checkbox" class="photo-check" data-id="${p.id}" ${_selectedPhotos.has(p.id) ? 'checked' : ''}>
       <span class="photo-status ${p.status}">${p.status}</span>
       <img src="${p.url}" loading="lazy" alt="">
       <div class="photo-tags">
@@ -376,10 +384,55 @@ async function loadPhotos() {
     </div>
   `).join('');
 
-  grid.querySelectorAll('.photo-cell').forEach(cell => {
-    cell.addEventListener('click', () => openPhotoModal(JSON.parse(cell.dataset.photo)));
+  grid.querySelectorAll('.photo-check').forEach(cb => {
+    cb.addEventListener('click', e => e.stopPropagation());
+    cb.addEventListener('change', e => {
+      const id = e.target.dataset.id;
+      if (e.target.checked) _selectedPhotos.add(id); else _selectedPhotos.delete(id);
+      e.target.closest('.photo-cell').classList.toggle('selected', e.target.checked);
+      updateSelectionBar();
+    });
   });
+  grid.querySelectorAll('.photo-cell').forEach(cell => {
+    cell.addEventListener('click', e => {
+      if (e.target.classList.contains('photo-check')) return;
+      openPhotoModal(JSON.parse(cell.dataset.photo));
+    });
+  });
+  updateSelectionBar();
 }
+
+function updateSelectionBar() {
+  const bar = document.getElementById('selection-bar');
+  if (!bar) return;
+  const n = _selectedPhotos.size;
+  bar.hidden = n === 0;
+  bar.querySelector('#selection-count').textContent = `${n} selected`;
+}
+
+window.bulkDeleteSelectedPhotos = async () => {
+  const ids = Array.from(_selectedPhotos);
+  if (!ids.length) return;
+  if (!confirm(`Delete ${ids.length} photo${ids.length === 1 ? '' : 's'}?\n\nThis removes them from the trip + storage. Cannot be undone.`)) return;
+  const btn = document.getElementById('selection-delete');
+  btn.disabled = true; btn.textContent = `Deleting ${ids.length}…`;
+  let failed = 0;
+  for (const id of ids) {
+    try { await api(`/photos/${id}`, { method: 'DELETE' }); }
+    catch { failed++; }
+  }
+  _selectedPhotos.clear();
+  btn.disabled = false; btn.textContent = 'Delete selected';
+  if (failed) alert(`${failed} delete${failed === 1 ? '' : 's'} failed.`);
+  await loadPhotos();
+};
+
+window.clearPhotoSelection = () => {
+  _selectedPhotos.clear();
+  document.querySelectorAll('.photo-check').forEach(cb => { cb.checked = false; });
+  document.querySelectorAll('.photo-cell.selected').forEach(c => c.classList.remove('selected'));
+  updateSelectionBar();
+};
 
 // ---------- modal ----------
 const modal = document.getElementById('modal');
@@ -517,16 +570,45 @@ async function renderTripDay(dayId) {
     tbody.innerHTML = '<tr><td colspan="4" class="empty">No items yet.</td></tr>';
   } else {
     tbody.innerHTML = data.items.map(it => `
-      <tr>
-        <td class="muted small" style="white-space:nowrap;">${(it.start_time||'?').slice(0,5)} – ${(it.end_time||'?').slice(0,5)}</td>
+      <tr data-item-id="${it.id}">
+        <td class="time-cell">
+          <input type="time" class="time-input start" data-field="start_time" value="${(it.start_time||'').slice(0,5)}">
+          <span class="muted">–</span>
+          <input type="time" class="time-input end" data-field="end_time" value="${(it.end_time||'').slice(0,5)}">
+          <span class="time-status muted small"></span>
+        </td>
         <td>
           <strong>${escapeHtml(it.title)}</strong>
           ${it.description ? `<div class="muted small" style="margin-top:2px;">${escapeHtml(it.description)}</div>` : ''}
         </td>
         <td><span class="muted small">${it.importance}/10</span> ${'★'.repeat(Math.min(5, Math.round(it.importance / 2)))}</td>
-        <td class="num">${it.photo_count}</td>
+        <td class="num photo-count-cell">${it.photo_count}</td>
       </tr>
     `).join('');
+
+    // Wire up inline edits
+    tbody.querySelectorAll('input.time-input').forEach(inp => {
+      inp.addEventListener('change', async e => {
+        const tr = e.target.closest('tr');
+        const itemId = tr.dataset.itemId;
+        const field = e.target.dataset.field;
+        const newValue = e.target.value;
+        const status = tr.querySelector('.time-status');
+        status.textContent = 'saving…';
+        try {
+          const updated = await api(`/itinerary-items/${itemId}`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ [field]: newValue }),
+          });
+          status.textContent = 'saved';
+          tr.querySelector('.photo-count-cell').textContent = updated.photo_count;
+          setTimeout(() => { status.textContent = ''; }, 1500);
+        } catch (err) {
+          status.textContent = '❌ ' + err.message;
+        }
+      });
+    });
   }
 
   await loadRenderHistory(dayId);

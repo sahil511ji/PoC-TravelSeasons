@@ -1,6 +1,7 @@
 export interface PhotoSpec {
   url: string;
-  title?: string;
+  title?: string;              // descriptive item title — admin-facing
+  caption?: string;            // diary-style line shown over the photo in recap
   importance: number;          // 1-10
 }
 

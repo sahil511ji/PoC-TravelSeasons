@@ -86,6 +86,7 @@ class ItineraryItem(SQLModel, table=True):
     end_time: time | None = None
     title: str
     description: str | None = None
+    caption: str | None = None   # diary-style one-liner shown in recap video
     importance: int = Field(default=5)
     position: int = Field(default=0)
     created_at: datetime = Field(default_factory=_now)

@@ -85,6 +85,7 @@ class ItineraryItemIn(BaseModel):
     end_time: time | None = None
     title: str
     description: str | None = None
+    caption: str | None = None
     importance: int = 5
 
 
@@ -92,6 +93,15 @@ class ItineraryItemOut(ItineraryItemIn):
     id: str
     position: int
     photo_count: int = 0
+
+
+class ItineraryItemUpdate(BaseModel):
+    start_time: time | None = None
+    end_time: time | None = None
+    title: str | None = None
+    description: str | None = None
+    caption: str | None = None
+    importance: int | None = None
 
 
 class TripDayCreate(BaseModel):

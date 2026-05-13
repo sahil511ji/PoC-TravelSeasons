@@ -190,9 +190,12 @@ async def _render_via_remotion(
     photo_specs = []
     for p in ordered:
         item = item_by_id.get(p.itinerary_item_id or "")
+        # Prefer the diary-style caption; fall back to the descriptive title.
+        caption = (item.caption if item and item.caption else (item.title if item else None))
         photo_specs.append({
             "url": storage.public_url(p.storage_path),
             "title": item.title if item else None,
+            "caption": caption,
             "importance": int(item.importance) if item else 5,
         })
 

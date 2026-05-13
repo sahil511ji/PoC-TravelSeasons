@@ -130,6 +130,12 @@
         <select id="me-user" hidden></select>
       </div>
 
+      <div id="selection-bar" class="selection-bar" hidden>
+        <span id="selection-count">0 selected</span>
+        <button id="selection-delete" onclick="bulkDeleteSelectedPhotos()" style="background:var(--red);">Delete selected</button>
+        <button class="ghost" onclick="clearPhotoSelection()">Clear</button>
+      </div>
+
       <div id="photos-grid" class="grid photos-grid"></div>
     </div>
   </section>

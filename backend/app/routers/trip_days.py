@@ -11,6 +11,7 @@ from ..deps import db_session, get_storage
 from ..models import ItineraryItem, Photo, Trip, TripDay, VideoRender
 from ..schemas import (
     ItineraryItemOut,
+    ItineraryItemUpdate,
     TripDayCreate,
     TripDayOut,
     TripDaySummaryOut,
@@ -64,14 +65,39 @@ def create_trip_day(
     session.flush()
 
     items_data = parsed.get("items") or []
+    # Safety net: even if Gemini ignores the rule, never persist zero-duration
+    # windows. Tile end_time = next item's start_time; last item gets +15 min.
+    parsed_pairs: list[tuple[time_type | None, time_type | None]] = [
+        (_parse_time(d.get("start_time")), _parse_time(d.get("end_time")))
+        for d in items_data
+    ]
+    from datetime import datetime as _dt, timedelta as _td
+    for i, (st, et) in enumerate(parsed_pairs):
+        if st is None:
+            continue
+        if et is None or et <= st:
+            # Find next item's start to tile against
+            next_st = None
+            for j in range(i + 1, len(parsed_pairs)):
+                if parsed_pairs[j][0] is not None:
+                    next_st = parsed_pairs[j][0]
+                    break
+            if next_st is not None and next_st > st:
+                parsed_pairs[i] = (st, next_st)
+            else:
+                # Last item or no later start — add 15 minutes
+                end = (_dt.combine(_dt.today(), st) + _td(minutes=15)).time()
+                parsed_pairs[i] = (st, end)
+
     items_out: list[ItineraryItem] = []
-    for pos, item_data in enumerate(items_data):
+    for pos, (item_data, (st, et)) in enumerate(zip(items_data, parsed_pairs)):
         item = ItineraryItem(
             trip_day_id=day.id,
-            start_time=_parse_time(item_data.get("start_time")),
-            end_time=_parse_time(item_data.get("end_time")),
+            start_time=st,
+            end_time=et,
             title=item_data.get("title", "Untitled"),
             description=item_data.get("description"),
+            caption=item_data.get("caption"),
             importance=int(item_data.get("importance") or 5),
             position=pos,
         )
@@ -166,6 +192,53 @@ def delete_trip_day(day_id: str, session: Session = Depends(db_session)):
     session.commit()
 
 
+@router.patch("/itinerary-items/{item_id}", response_model=ItineraryItemOut)
+def update_itinerary_item(
+    item_id: str,
+    payload: ItineraryItemUpdate,
+    session: Session = Depends(db_session),
+):
+    """Edit an itinerary item (title/times/importance). Auto-rematches photos
+    in the parent day to keep linkages fresh."""
+    item = session.get(ItineraryItem, item_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="itinerary_item not found")
+    if payload.start_time is not None:
+        item.start_time = payload.start_time
+    if payload.end_time is not None:
+        item.end_time = payload.end_time
+    if payload.title is not None:
+        item.title = payload.title
+    if payload.description is not None:
+        item.description = payload.description
+    if payload.importance is not None:
+        item.importance = max(1, min(10, int(payload.importance)))
+    session.add(item)
+    session.commit()
+    session.refresh(item)
+
+    # Auto-rematch photos in this day so the photo counts update immediately.
+    day = session.get(TripDay, item.trip_day_id)
+    if day is not None:
+        _rematch_photos_in_day(session, day)
+        session.commit()
+
+    photo_count = len(session.exec(
+        select(Photo.id).where(Photo.itinerary_item_id == item.id)
+    ).all())
+    return ItineraryItemOut(
+        id=item.id,
+        position=item.position,
+        start_time=item.start_time,
+        end_time=item.end_time,
+        title=item.title,
+        description=item.description,
+        caption=item.caption,
+        importance=item.importance,
+        photo_count=photo_count,
+    )
+
+
 # ---------- helpers ----------
 
 def _rematch_photos_in_day(session: Session, day: TripDay) -> int:
@@ -212,6 +285,7 @@ def _day_to_out(session: Session, day: TripDay) -> TripDayOut:
             end_time=i.end_time,
             title=i.title,
             description=i.description,
+            caption=i.caption,
             importance=i.importance,
             photo_count=item_counts[i.id],
         )

@@ -36,8 +36,9 @@ Return your response as STRICT JSON matching this schema:
     {{
       "start_time": "HH:MM (24h)",
       "end_time": "HH:MM (24h)",
-      "title": "short activity name, e.g. 'Chinatown walking tour'",
+      "title": "short activity name, descriptive — admin sees this, e.g. 'Chinatown walking tour'",
       "description": "1-2 sentence summary of what happened",
+      "caption": "diary-style one-liner shown over the photos in the recap video. 10-15 words, first-person plural ('we'), past tense, conversational, warm. Mention specifics from the description (places, food, names). NO exclamation marks. e.g. 'Walked Chinatown's red lanterns — the temple looked like home.'",
       "importance": 1-10
     }}
   ],
@@ -52,7 +53,16 @@ Return your response as STRICT JSON matching this schema:
 }}
 
 Rules:
-- start_time and end_time MUST be 24-hour HH:MM strings; if a single moment, repeat the start time as end_time.
+- start_time and end_time MUST be 24-hour HH:MM strings (e.g. "09:30", "14:32").
+- **CRITICAL: end_time MUST be strictly LATER than start_time.** Never repeat
+  start_time as end_time. Every activity must have a non-zero duration.
+- If the input describes a single moment (e.g. "2:32 PM — First Frame"),
+  set end_time to the NEXT activity's start_time (so the windows tile cleanly).
+  For the LAST activity in the day, set end_time to start_time + 15 minutes.
+- If the input gives an explicit range (e.g. "2:30 – 4:00 PM"), use both.
+- Order items in chronological order by start_time. position MUST be 0, 1, 2…
+- Activities should TILE the day — no gaps where possible. If two moments are
+  close ("2:32 PM" and "2:33 PM"), end the first activity at the second's start.
 - importance: 1 = filler/transition, 10 = the absolute hero shot.
 - Filmable moments are the 3-5 most emotionally weighted moments (e.g. surprise birthday cake, group laughter, sunset, tears).
 - voiceover_script tone: warm and gentle, suitable for a 65+ Indian audience. No "amazing!" / "incredible!" / exclamation marks.

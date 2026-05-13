@@ -64,30 +64,39 @@ export const Recap: React.FC<RenderSpec> = ({
           />
         </Sequence>
 
-        {/* 2 — Photo sequences with crossfade overlap */}
-        {kept.map((p, i) => {
-          const start = photosFrom + i * step;
-          const motion = MOTIONS[i % MOTIONS.length];
-          const showTitle = !!p.title && p.importance >= 7;
-          return (
-            <Sequence
-              key={`photo-${i}`}
-              from={start}
-              durationInFrames={photoSceneFrames}
-              name={`Photo ${i + 1}`}
-            >
-              <PhotoScene src={p.url} motion={motion} />
-              {showTitle && (
-                <Sequence
-                  from={Math.round(0.20 * photoSceneFrames)}
-                  durationInFrames={Math.round(0.62 * photoSceneFrames)}
-                >
-                  <TitleOverlay eyebrow={daySubtitle} title={p.title!} />
-                </Sequence>
-              )}
-            </Sequence>
-          );
-        })}
+        {/* 2 — Photo sequences with crossfade overlap.
+            Captions only show on the FIRST photo of each unique activity. */}
+        {(() => {
+          const seenActivities = new Set<string>();
+          return kept.map((p, i) => {
+            const start = photosFrom + i * step;
+            const motion = MOTIONS[i % MOTIONS.length];
+            const activityKey = p.title || p.caption || '';
+            const isFirstOfActivity = !!activityKey && !seenActivities.has(activityKey);
+            if (isFirstOfActivity) seenActivities.add(activityKey);
+            // Diary caption is preferred; fall back to title.
+            const overlayText = p.caption || p.title;
+            const showOverlay = isFirstOfActivity && !!overlayText && p.importance >= 7;
+            return (
+              <Sequence
+                key={`photo-${i}`}
+                from={start}
+                durationInFrames={photoSceneFrames}
+                name={`Photo ${i + 1}`}
+              >
+                <PhotoScene src={p.url} motion={motion} />
+                {showOverlay && (
+                  <Sequence
+                    from={Math.round(0.20 * photoSceneFrames)}
+                    durationInFrames={Math.round(0.62 * photoSceneFrames)}
+                  >
+                    <TitleOverlay eyebrow={daySubtitle} title={overlayText!} />
+                  </Sequence>
+                )}
+              </Sequence>
+            );
+          });
+        })()}
 
         {/* 3 — End card */}
         <Sequence from={outroFrom} durationInFrames={outroFrames}>
