@@ -45,12 +45,24 @@ export async function renderRecap(spec: RenderSpec): Promise<string> {
 
     // Pre-fetch word timings ONCE in Node before bundling into Chromium tabs.
     // Otherwise every parallel tab refetches independently, killing render speed.
+    // Retry once on transient network failures so a Supabase hiccup doesn't kill captions.
     if (spec.timingUrl && !spec.wordTimings) {
-      try {
-        const res = await fetch(spec.timingUrl);
-        if (res.ok) spec.wordTimings = await res.json();
-      } catch (e) {
-        console.warn('[render] timing.json fetch failed, captions disabled:', (e as Error).message);
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const res = await fetch(spec.timingUrl);
+          if (res.ok) {
+            spec.wordTimings = await res.json();
+            console.log(`[render] timing.json fetched (${(spec.wordTimings ?? []).length} words, attempt ${attempt})`);
+            break;
+          }
+          console.warn(`[render] timing.json fetch returned ${res.status} (attempt ${attempt}/2)`);
+        } catch (e) {
+          console.warn(`[render] timing.json fetch failed attempt ${attempt}/2:`, (e as Error).message);
+        }
+        if (attempt < 2) await new Promise((r) => setTimeout(r, 2000));
+      }
+      if (!spec.wordTimings) {
+        console.warn('[render] timing.json unavailable after retries — captions disabled for this render');
       }
     }
 
@@ -69,6 +81,7 @@ export async function renderRecap(spec: RenderSpec): Promise<string> {
     );
 
     console.log(`[render] start: id=${spec.videoRenderId} frames=${durationInFrames} photos=${spec.photos.length}`);
+    console.log(`[render] received photo URLs in order:`, spec.photos.map(p => p.url.split('/').pop()));
 
     await renderMedia({
       composition: {

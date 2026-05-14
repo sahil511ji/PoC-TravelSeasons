@@ -25,7 +25,7 @@ def rematch_unmatched_after_enrol(session: Session, new_user: User) -> int:
     if not new_user.rekognition_face_id:
         return 0
     eng = get_engine()
-    matches = eng.search_unmatched_for_user(new_user.rekognition_face_id)
+    matches = eng.search_unmatched_for_user(new_user.rekognition_face_id, caller_user_id=new_user.id)
     # matches is already filtered to ExternalImageId starting with "unmatched:"
     tagged_face_ids: list[str] = []
     for face_id, eid, sim in matches:

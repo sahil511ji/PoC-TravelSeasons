@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Travel Seasons · PoC Admin</title>
 <link rel="stylesheet" href="style.css">
+<script src="vendor/sortable.min.js" defer></script>
 </head>
 <body>
 <header class="topbar">
@@ -178,10 +179,36 @@
       </div>
     </div>
 
-    <!-- 3 · Recap video -->
+    <!-- 3 · Photos in recap -->
     <div class="section">
       <div class="section-header">
-        <h2>3 · Recap video</h2>
+        <h2>3 · Photos in recap</h2>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <span id="recap-photos-status" class="muted small"></span>
+          <button id="recap-set-order" class="primary">✓ Set order</button>
+        </div>
+      </div>
+      <p class="muted small">Drag the handle to reorder. After you're happy with the order, click <strong>Set order</strong> to save it. Checkbox / add / remove save automatically.</p>
+      <div id="recap-photos-empty" class="muted" hidden>No photos for this day yet — upload them via the trip page.</div>
+      <div id="recap-selected-wrap">
+        <div class="recap-sub-header">
+          <span><strong id="recap-selected-count">0</strong> in recap</span>
+        </div>
+        <div id="recap-selected-grid" class="photos-grid recap-grid"></div>
+      </div>
+      <div id="recap-unselected-wrap" hidden>
+        <div class="recap-sub-header" style="margin-top:16px;">
+          <span>Not in recap (<strong id="recap-unselected-count">0</strong>)</span>
+          <button id="recap-add-all" class="ghost small">Add all →</button>
+        </div>
+        <div id="recap-unselected-grid" class="photos-grid recap-grid"></div>
+      </div>
+    </div>
+
+    <!-- 4 · Recap video -->
+    <div class="section">
+      <div class="section-header">
+        <h2>4 · Recap video</h2>
         <div style="display:flex;gap:8px;align-items:center;">
           <label class="muted small" style="display:flex;align-items:center;gap:6px;">
             Engine:

@@ -45,6 +45,7 @@ async def lifespan(app: FastAPI):
                  result["face_count"], result["status"])
     except Exception:
         log.exception("ensure_collection failed; face features will not work")
+
     yield
 
 

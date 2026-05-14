@@ -61,6 +61,7 @@ class Photo(SQLModel, table=True):
     processed_at: datetime | None = None
     taken_at: datetime | None = None
     itinerary_item_id: str | None = Field(default=None, foreign_key="itinerary_item.id", index=True)
+    recap_position: int | None = None  # NULL = excluded from recap; integer = ordered position within day
 
 
 class TripDay(SQLModel, table=True):

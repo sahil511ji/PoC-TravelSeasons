@@ -47,12 +47,21 @@ async def delete_user(user_id: str, session: Session = Depends(db_session)):
         except Exception:
             log.warning("delete selfie file failed (non-fatal)", exc_info=True)
 
-    # Remove user's face from the Rekognition collection (best-effort).
-    if user.rekognition_face_id:
+    # Remove ALL of the user's faces from the Rekognition collection (canonical
+    # selfie + any manual-tag face_ids added later via /manual-tag).
+    if user.rekognition_face_id is not None:
         try:
-            await asyncio.to_thread(get_engine().delete_face, user.rekognition_face_id)
+            face_ids = await asyncio.to_thread(get_engine().list_user_face_ids, user_id)
+            if face_ids:
+                try:
+                    await asyncio.to_thread(get_engine().bulk_delete_faces, face_ids)
+                except Exception:
+                    log.warning(
+                        "bulk_delete_faces during user-delete had partial failures",
+                        exc_info=True,
+                    )
         except Exception:
-            log.warning("delete_face from collection failed (non-fatal)", exc_info=True)
+            log.warning("list_user_face_ids failed (non-fatal)", exc_info=True)
         user.rekognition_face_id = None
 
     # Soft-delete the user row + blank legacy embedding.

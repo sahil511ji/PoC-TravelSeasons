@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import uuid
 from typing import Literal
 
@@ -13,14 +15,24 @@ from fastapi import (
     Query,
     UploadFile,
 )
+from sqlalchemy import text
 from sqlmodel import Session, select
 
 from ..deps import db_session, get_storage, x_user_id
+from ..face import crop_face, get_engine
 from ..models import Photo, PhotoFace, Trip, User
-from ..schemas import FaceOverride, FaceTagOut, PhotoOut, PhotoStatusOut
+from ..schemas import (
+    FaceOverride,
+    FaceTagOut,
+    ManualTagIn,
+    ManualTagOut,
+    PhotoOut,
+    PhotoStatusOut,
+)
 from ..services.exif import match_to_itinerary, read_taken_at
 from ..tasks.process_photos import schedule_photo_processing
 
+log = logging.getLogger(__name__)
 router = APIRouter(tags=["photos"])
 
 
@@ -50,6 +62,18 @@ async def upload_photos(
             match_to_itinerary(session, trip_id=trip_id, taken_at=taken_at) if taken_at else None
         )
 
+        # Default recap_position: append to end of day's existing selection.
+        # NULL if photo isn't matched to a day yet.
+        recap_position: int | None = None
+        if itinerary_item_id is not None:
+            recap_position = session.exec(
+                text(
+                    "SELECT COALESCE(MAX(p.recap_position), 0) + 1 "
+                    "FROM photo p JOIN itinerary_item ii ON ii.id = p.itinerary_item_id "
+                    "WHERE ii.trip_day_id = (SELECT trip_day_id FROM itinerary_item WHERE id = :iid)"
+                ).bindparams(iid=itinerary_item_id)
+            ).scalar()
+
         photo = Photo(
             id=photo_id,
             trip_id=trip_id,
@@ -57,6 +81,7 @@ async def upload_photos(
             status="pending",
             taken_at=taken_at,
             itinerary_item_id=itinerary_item_id,
+            recap_position=recap_position,
         )
         session.add(photo)
         session.commit()
@@ -82,6 +107,7 @@ def _photo_to_out(photo: Photo, faces: list[PhotoFace], users_by_id: dict[str, U
                 confidence=f.confidence,
                 source=f.source,
                 bbox=bbox,
+                bbox_space=f.bbox_space or "normalised",
             )
         )
     return PhotoOut(
@@ -93,6 +119,7 @@ def _photo_to_out(photo: Photo, faces: list[PhotoFace], users_by_id: dict[str, U
         uploaded_at=photo.uploaded_at,
         taken_at=photo.taken_at,
         itinerary_item_id=photo.itinerary_item_id,
+        recap_position=photo.recap_position,
         faces=face_outs,
     )
 
@@ -160,42 +187,43 @@ def trip_photos_status(trip_id: str, session: Session = Depends(db_session)):
 
 
 @router.patch("/photos/{photo_id}/faces", response_model=PhotoOut)
-def override_photo_faces(
+async def override_photo_faces(
     photo_id: str,
     body: FaceOverride,
     session: Session = Depends(db_session),
 ):
+    """Remove face tags. Also cleans up the Rekognition collection for
+    `unmatched:*` entries (rows where `user_id IS NULL` AND `rekognition_face_id`
+    is set were indexed under an `unmatched:` ExternalImageId).
+    """
     storage = get_storage()
     photo = session.get(Photo, photo_id)
     if photo is None:
         raise HTTPException(status_code=404, detail="photo not found")
 
-    if body.remove_face_ids:
-        for face_id in body.remove_face_ids:
-            f = session.get(PhotoFace, face_id)
-            if f and f.photo_id == photo_id:
-                f.removed = True
-                f.source = "manual"
-                session.add(f)
+    eng = get_engine()
+    face_ids_to_delete_in_aws: list[str] = []
 
-    for add in body.add:
-        u = session.get(User, add.user_id)
-        if u is None:
-            continue
-        bbox = add.bbox or [0.0, 0.0, 0.0, 0.0]
-        embedding = u.face_embedding or "[]"
-        face = PhotoFace(
-            photo_id=photo_id,
-            user_id=add.user_id,
-            bbox=json.dumps(bbox),
-            embedding=embedding,
-            confidence=None,
-            source="manual",
-            removed=False,
-        )
-        session.add(face)
+    for face_id in body.remove_face_ids:
+        f = session.get(PhotoFace, face_id)
+        if f and f.photo_id == photo_id and not f.removed:
+            # Proxy: user_id IS NULL + rekognition_face_id IS NOT NULL → it's an
+            # unmatched:* AWS entry, safe to delete. Real-user face_ids stay in
+            # the collection (they may be a user's canonical or manual tag).
+            if f.user_id is None and f.rekognition_face_id:
+                face_ids_to_delete_in_aws.append(f.rekognition_face_id)
+            f.removed = True
+            f.source = "manual"
+            session.add(f)
 
     session.commit()
+
+    # Post-commit AWS cleanup (best-effort)
+    if face_ids_to_delete_in_aws:
+        try:
+            await asyncio.to_thread(eng.bulk_delete_faces, face_ids_to_delete_in_aws)
+        except Exception:
+            log.warning("bulk_delete_faces after remove failed; orphans remain", exc_info=True)
 
     faces = session.exec(
         select(PhotoFace).where(PhotoFace.photo_id == photo_id, PhotoFace.removed == False)  # noqa: E712
@@ -207,6 +235,149 @@ def override_photo_faces(
             users_by_id[u.id] = u
 
     return _photo_to_out(photo, faces, users_by_id, storage)
+
+
+@router.post("/photos/{photo_id}/manual-tag", response_model=ManualTagOut)
+async def manual_tag(
+    photo_id: str,
+    body: ManualTagIn,
+    session: Session = Depends(db_session),
+):
+    """Admin draws a bbox + picks a user → backend crops, indexes into AWS,
+    propagates to all matching `unmatched:*` entries across the collection."""
+    photo = session.get(Photo, photo_id)
+    if photo is None:
+        raise HTTPException(status_code=404, detail="photo not found")
+    # Block while photo is mid-processing; auto pipeline would race the manual tag.
+    if photo.status in ("pending", "processing"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"photo still {photo.status} — try again shortly",
+        )
+
+    user = session.get(User, body.user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="user not found")
+    if user.deleted_at is not None:
+        raise HTTPException(status_code=410, detail="user has been deleted")
+
+    replaced: PhotoFace | None = None
+    if body.replace_photoface_id:
+        replaced = session.get(PhotoFace, body.replace_photoface_id)
+        if replaced and replaced.photo_id != photo_id:
+            raise HTTPException(
+                status_code=400, detail="replace_photoface_id is on a different photo"
+            )
+
+    storage = get_storage()
+    try:
+        image_bytes = await storage.get_bytes(photo.storage_path)
+    except Exception as e:
+        log.exception("get_bytes failed for photo %s", photo_id)
+        raise HTTPException(status_code=502, detail="photo storage unreachable") from e
+
+    crop_bytes, crop_err = crop_face(image_bytes, body.bbox)
+    if crop_bytes is None:
+        raise HTTPException(
+            status_code=400, detail=f"selection too small after 15% padding ({crop_err})"
+        )
+
+    eng = get_engine()
+    try:
+        new_face_id = await asyncio.to_thread(eng.index_manual_face, crop_bytes, user.id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    linked_face_ids: list[str] = []
+    propagated_photo_ids: list[str] = []
+    try:
+        pf = PhotoFace(
+            photo_id=photo_id,
+            user_id=user.id,
+            bbox=json.dumps(body.bbox),
+            bbox_space="normalised",
+            embedding=None,
+            rekognition_face_id=new_face_id,
+            confidence=None,
+            source="manual",
+            removed=False,
+            error=None,
+        )
+        session.add(pf)
+
+        if replaced and not replaced.removed:
+            # Proxy: user_id IS NULL → unmatched:* entry, queue for cleanup
+            if replaced.user_id is None and replaced.rekognition_face_id:
+                linked_face_ids.append(replaced.rekognition_face_id)
+            replaced.removed = True
+            replaced.source = "manual"
+            session.add(replaced)
+
+        if user.rekognition_face_id is None:
+            user.rekognition_face_id = new_face_id
+            session.add(user)
+
+        # Propagation across the entire collection (cross-trip is intentional).
+        matches = await asyncio.to_thread(
+            eng.search_unmatched_for_user, new_face_id, user.id
+        )
+        for face_id, ext_id, sim in matches:
+            pf_id = ext_id.split(":", 1)[1]
+            tgt = session.get(PhotoFace, pf_id)
+            if tgt is None or tgt.removed or tgt.user_id is not None:
+                continue
+            tgt.user_id = user.id
+            tgt.rekognition_face_id = user.rekognition_face_id
+            tgt.confidence = sim
+            tgt.source = "auto"
+            tgt.error = None
+            session.add(tgt)
+            propagated_photo_ids.append(tgt.photo_id)
+            linked_face_ids.append(face_id)
+
+        # Commit DB FIRST — AWS leftovers recoverable, post-commit DB rollback is not.
+        session.commit()
+    except Exception:
+        session.rollback()
+        try:
+            await asyncio.to_thread(eng.delete_face, new_face_id)
+        except Exception:
+            log.exception(
+                "CRITICAL: orphaned AWS face_id=%s after DB failure", new_face_id
+            )
+        raise
+
+    # Post-commit AWS cleanup
+    if linked_face_ids:
+        try:
+            await asyncio.to_thread(eng.bulk_delete_faces, linked_face_ids)
+        except Exception:
+            log.warning(
+                "bulk_delete_faces post-commit failed; orphans remain", exc_info=True
+            )
+
+    log.info(
+        "manual_tag photo_id=%s user_id=%s new_face_id=%s propagated=%d replaced=%s",
+        photo_id, user.id, new_face_id, len(propagated_photo_ids), bool(replaced),
+    )
+
+    # Re-query for response (uses existing _photo_to_out signature)
+    faces = session.exec(
+        select(PhotoFace).where(
+            PhotoFace.photo_id == photo_id, PhotoFace.removed == False  # noqa: E712
+        )
+    ).all()
+    user_ids = {f.user_id for f in faces if f.user_id}
+    users_by_id: dict[str, User] = {}
+    if user_ids:
+        for u in session.exec(select(User).where(User.id.in_(list(user_ids)))).all():  # type: ignore[attr-defined]
+            users_by_id[u.id] = u
+
+    return ManualTagOut(
+        photo=_photo_to_out(photo, faces, users_by_id, storage),
+        propagated_count=len(propagated_photo_ids),
+        propagated_photo_ids=sorted(set(propagated_photo_ids)),
+    )
 
 
 @router.delete("/photos/{photo_id}", status_code=204)

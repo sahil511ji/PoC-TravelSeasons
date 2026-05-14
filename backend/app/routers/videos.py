@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from sqlmodel import Session, select
 
+from sqlalchemy import func
+
 from ..deps import db_session, get_storage
-from ..models import TripDay, VideoRender
+from ..models import ItineraryItem, Photo, TripDay, VideoRender
 from ..schemas import VideoGenerateRequest, VideoRenderOut, VideoReviewRequest
 from ..tasks.build_recap import run_recap
 
@@ -23,6 +25,7 @@ def _to_out(vr: VideoRender, storage) -> VideoRenderOut:
         mp4_url=storage.public_url(vr.mp4_storage_path) if vr.mp4_storage_path else None,
         duration_seconds=vr.duration_seconds,
         admin_notes=vr.admin_notes,
+        error=vr.error,
         created_at=vr.created_at,
         reviewed_at=vr.reviewed_at,
     )
@@ -40,6 +43,30 @@ def generate_recap(
         raise HTTPException(status_code=404, detail="trip_day not found")
     if not (day.voiceover_script or "").strip():
         raise HTTPException(status_code=400, detail="voiceover_script empty — write/regenerate it first")
+
+    # Empty-selection gate — refuse before queueing a doomed render.
+    import logging as _logging
+    _log = _logging.getLogger("recap-order")
+    selected_rows = session.exec(
+        select(Photo.id, Photo.recap_position)
+        .join(ItineraryItem, ItineraryItem.id == Photo.itinerary_item_id)
+        .where(
+            ItineraryItem.trip_day_id == day_id,
+            Photo.recap_position.is_not(None),  # type: ignore[attr-defined]
+        )
+        .order_by(Photo.recap_position)
+    ).all()
+    selected_count = len(selected_rows)
+    _log.info(
+        "[POST /generate-recap] day=%s selected_count=%d order=%s",
+        day_id, selected_count,
+        [(pid[:8], pos) for pid, pos in selected_rows],
+    )
+    if not selected_count:
+        raise HTTPException(
+            status_code=400,
+            detail="No photos selected for this day's recap. Open the day in admin and pick some.",
+        )
 
     # Determine next version
     latest = session.exec(

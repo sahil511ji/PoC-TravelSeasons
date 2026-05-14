@@ -29,8 +29,14 @@ class Settings(BaseSettings):
     AWS_ACCOUNT_ID: str = ""  # optional; if set, lifespan asserts sts identity matches
     REKOGNITION_COLLECTION_ID: str = "travelseasons-poc"
     REKOGNITION_FACE_MATCH_THRESHOLD: float = 80.0  # percent 0-100
+    REKOGNITION_MANUAL_PROPAGATION_THRESHOLD: float = 80.0  # for manual-tag → unmatched: propagation
     REKOGNITION_QUALITY_FILTER: str = "AUTO"  # NONE | LOW | MEDIUM | HIGH | AUTO
     ALLOW_COLLECTION_DRIFT: bool = False  # if true, skip face_count vs DB drift check
+
+    # TTS — provider dispatch + Google Cloud TTS config
+    TTS_PROVIDER: str = "google_cloud_tts"  # 'google_cloud_tts' or 'elevenlabs' (fallback)
+    GOOGLE_API_KEY: str = ""  # Google Cloud API key with Cloud TTS enabled
+    GOOGLE_TTS_VOICE_NAME: str = "en-IN-Neural2-A"  # Indian English female, supports SSML marks
 
     PUBLIC_BASE_URL: str = "http://localhost:8000"
     CORS_ORIGINS: str = "http://localhost:8000,http://localhost:3000,http://localhost:5173"

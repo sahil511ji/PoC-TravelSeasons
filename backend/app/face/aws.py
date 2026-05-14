@@ -275,6 +275,63 @@ class AwsFaceEngine:
 
     # ---------- unmatched-face index for cross-photo rematch ----------
 
+    def index_manual_face(self, crop_bytes: bytes, user_id: str) -> str:
+        """Index an admin-tagged face crop under a real user's ExternalImageId.
+
+        Returns the new FaceId. Raises ValueError if the crop has no detectable
+        face or multiple faces.
+
+        QualityFilter is hardcoded to 'NONE' here — admin asserts ground truth,
+        the DetectFaces gate already guaranteed exactly one face, and quality
+        rejection on a tight crop is more confusing than useful.
+        """
+        # Gate: DetectFaces first to ensure exactly one face in the crop.
+        det = self._client.detect_faces(Image={"Bytes": crop_bytes}, Attributes=["DEFAULT"])
+        det_faces = det.get("FaceDetails", []) or []
+        if len(det_faces) == 0:
+            raise ValueError("No face detected in the selected region")
+        if len(det_faces) > 1:
+            raise ValueError(f"Selected region contains {len(det_faces)} faces — tighten the box")
+
+        resp = self._client.index_faces(
+            CollectionId=self._collection_id,
+            Image={"Bytes": crop_bytes},
+            ExternalImageId=user_id,
+            MaxFaces=1,
+            QualityFilter="NONE",
+            DetectionAttributes=["DEFAULT"],
+        )
+        face_records = resp.get("FaceRecords", []) or []
+        if not face_records:
+            unindexed = resp.get("UnindexedFaces", []) or []
+            reasons = unindexed[0].get("Reasons", []) if unindexed else ["no_face_indexed"]
+            raise ValueError(f"Crop rejected by quality filter: {reasons}")
+
+        face_id = face_records[0]["Face"]["FaceId"]
+        request_id = resp.get("ResponseMetadata", {}).get("RequestId")
+        log.info(
+            "index_manual_face user_id=%s face_id=%s request_id=%s",
+            user_id, face_id, request_id,
+        )
+        return face_id
+
+    def list_user_face_ids(self, user_id: str) -> list[str]:
+        """All FaceIds in the collection whose ExternalImageId == user_id."""
+        out: list[str] = []
+        token = None
+        while True:
+            kwargs: dict[str, Any] = {"CollectionId": self._collection_id, "MaxResults": 4096}
+            if token:
+                kwargs["NextToken"] = token
+            resp = self._client.list_faces(**kwargs)
+            for f in resp.get("Faces", []) or []:
+                if f.get("ExternalImageId") == user_id:
+                    out.append(f["FaceId"])
+            token = resp.get("NextToken")
+            if not token:
+                break
+        return out
+
     def index_unmatched(self, crop_bytes: bytes, photoface_id: str) -> str | None:
         """Index an unmatched face crop so future enrolments can link it.
 
@@ -299,11 +356,17 @@ class AwsFaceEngine:
             return None
         return face_records[0]["Face"]["FaceId"]
 
-    def search_unmatched_for_user(self, user_face_id: str) -> list[tuple[str, str, float]]:
-        """Search the collection for unmatched faces that match a user's selfie.
+    def search_unmatched_for_user(
+        self, user_face_id: str, caller_user_id: str | None = None
+    ) -> list[tuple[str, str, float]]:
+        """Search the collection for unmatched faces that match a user's face.
 
         Returns ``[(face_id, external_image_id, similarity), ...]`` filtered to
         entries whose ExternalImageId starts with ``unmatched:``.
+
+        If ``caller_user_id`` is given, log a WARNING when any match has
+        ``ExternalImageId`` set to a DIFFERENT real user UUID (cross-user
+        collision / look-alike signal).
         """
         s = get_settings()
         try:
@@ -311,20 +374,28 @@ class AwsFaceEngine:
                 CollectionId=self._collection_id,
                 FaceId=user_face_id,
                 MaxFaces=4096,
-                FaceMatchThreshold=s.REKOGNITION_FACE_MATCH_THRESHOLD,
+                FaceMatchThreshold=s.REKOGNITION_MANUAL_PROPAGATION_THRESHOLD,
             )
         except ClientError as e:
             log.exception("search_unmatched_for_user failed: %s", e)
             return []
         out: list[tuple[str, str, float]] = []
+        cross_user_match_count = 0
         for m in resp.get("FaceMatches", []) or []:
             face = m.get("Face", {})
             eid = face.get("ExternalImageId") or ""
+            sim = float(m.get("Similarity", 0))
             if eid.startswith("unmatched:"):
-                out.append((face["FaceId"], eid, float(m.get("Similarity", 0))))
+                out.append((face["FaceId"], eid, sim))
+            elif caller_user_id and eid and eid != caller_user_id:
+                cross_user_match_count += 1
+                log.warning(
+                    "cross-user face collision: caller=%s matched_eid=%s similarity=%.1f face_id=%s",
+                    caller_user_id, eid, sim, face.get("FaceId"),
+                )
         log.info(
-            "search_unmatched_for_user user_face_id=%s total=%d filtered=%d",
-            user_face_id, len(resp.get("FaceMatches") or []), len(out),
+            "search_unmatched_for_user user_face_id=%s total=%d unmatched=%d cross_user=%d",
+            user_face_id, len(resp.get("FaceMatches") or []), len(out), cross_user_match_count,
         )
         return out
 

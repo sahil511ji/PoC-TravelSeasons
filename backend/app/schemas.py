@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, time
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class UserOut(BaseModel):
@@ -38,6 +38,12 @@ class FaceTagOut(BaseModel):
     confidence: float | None
     source: str
     bbox: list[float]
+    bbox_space: str = "normalised"  # 'pixel' (legacy) or 'normalised'
+
+
+class RecapPhotosUpdate(BaseModel):
+    """Replace-all selection + order for a day's recap photos."""
+    ordered_photo_ids: list[str]
 
 
 class PhotoOut(BaseModel):
@@ -49,6 +55,7 @@ class PhotoOut(BaseModel):
     uploaded_at: datetime
     taken_at: datetime | None = None
     itinerary_item_id: str | None = None
+    recap_position: int | None = None
     faces: list[FaceTagOut]
 
 
@@ -61,14 +68,34 @@ class PhotoStatusOut(BaseModel):
     percent: float
 
 
-class FaceAdd(BaseModel):
-    user_id: str
-    bbox: list[float] | None = None
-
-
 class FaceOverride(BaseModel):
     remove_face_ids: list[str] = []
-    add: list[FaceAdd] = []
+
+
+class ManualTagIn(BaseModel):
+    user_id: str
+    bbox: list[float]  # [x, y, w, h] normalised 0-1
+    replace_photoface_id: str | None = None
+
+    @field_validator("bbox")
+    @classmethod
+    def _bbox_in_unit_square(cls, v: list[float]) -> list[float]:
+        if len(v) != 4:
+            raise ValueError("bbox must have 4 elements: [x, y, w, h]")
+        x, y, w, h = v
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            raise ValueError("x and y must be in [0, 1]")
+        if not (w > 0 and h > 0):
+            raise ValueError("w and h must be > 0")
+        if x + w > 1.0 + 1e-6 or y + h > 1.0 + 1e-6:
+            raise ValueError("bbox extends beyond image")
+        return v
+
+
+class ManualTagOut(BaseModel):
+    photo: PhotoOut
+    propagated_count: int
+    propagated_photo_ids: list[str]
 
 
 class HealthOut(BaseModel):
@@ -130,6 +157,7 @@ class VideoRenderOut(BaseModel):
     mp4_url: str | None = None
     duration_seconds: int | None = None
     admin_notes: str | None = None
+    error: str | None = None
     created_at: datetime
     reviewed_at: datetime | None = None
 
@@ -152,6 +180,7 @@ class TripDayOut(BaseModel):
     voiceover_script: str | None
     filmable_moments: list[Any] | None
     items: list[ItineraryItemOut]
+    photos: list[PhotoOut] = []  # selected first by recap_position, then unselected
     photo_count: int
     latest_video: VideoRenderOut | None = None
 

@@ -30,6 +30,42 @@ function escapeHtml(s) {
   }[c]));
 }
 
+function shortName(s) {
+  if (!s) return '';
+  const parts = String(s).trim().split(/\s+/);
+  return parts[0].slice(0, 12);
+}
+
+// Cache /users across modal opens; invalidate on user CRUD.
+let _usersCache = null;
+async function getUsers() {
+  if (_usersCache === null) _usersCache = await api('/users');
+  return _usersCache;
+}
+function invalidateUsersCache() { _usersCache = null; }
+
+// Parse FastAPI's {"detail": "..."} out of api() throws.
+function parseApiError(e) {
+  const idx = (e?.message || '').indexOf('::');
+  if (idx < 0) return e?.message || String(e);
+  const rest = e.message.slice(idx + 2).trim();
+  try { return JSON.parse(rest).detail || e.message; } catch { return e.message; }
+}
+
+// Toast helper — vanilla, brief.
+function showToast(msg, kind = 'ok') {
+  let t = document.getElementById('toast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'toast';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.className = `toast ${kind} visible`;
+  clearTimeout(t._hideTimer);
+  t._hideTimer = setTimeout(() => t.classList.remove('visible'), 3000);
+}
+
 function fmtDate(s) {
   if (!s) return '';
   try { return new Date(s).toLocaleDateString(); } catch { return s; }
@@ -437,22 +473,41 @@ window.clearPhotoSelection = () => {
 // ---------- modal ----------
 const modal = document.getElementById('modal');
 const modalBody = document.getElementById('modal-body');
-document.getElementById('modal-close').addEventListener('click', () => modal.hidden = true);
-modal.addEventListener('click', e => { if (e.target === modal) modal.hidden = true; });
+
+// Per-modal state for the draw-bbox flow.
+let _modalState = null;  // { photo, users, drawing, dragOrigin, dragRect, resizeObserver }
+
+function closeModal() {
+  if (_modalState?.resizeObserver) _modalState.resizeObserver.disconnect();
+  _modalState = null;
+  modal.hidden = true;
+}
+document.getElementById('modal-close').addEventListener('click', closeModal);
+modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if (!_modalState || modal.hidden) return;
+  if (_modalState.drawing) { e.preventDefault(); cancelDraw(); return; }
+  closeModal();
+});
 
 async function openPhotoModal(photo) {
   modal.hidden = false;
   modalBody.innerHTML = `<div>Loading…</div>`;
-  const users = await api('/users');
+  const users = await getUsers();
   renderModalBody(photo, users);
 }
 
 function renderModalBody(photo, users) {
+  if (_modalState?.resizeObserver) _modalState.resizeObserver.disconnect();
+  _modalState = { photo, users, drawing: false, dragOrigin: null, dragRect: null, resizeObserver: null };
+
   modalBody.innerHTML = `
     <h2 style="margin:0">Photo · ${photo.status}</h2>
     <div class="muted small">${photo.id}</div>
-    <div class="modal-img-wrap">
-      <img src="${photo.url}" alt="">
+    <div class="modal-img-wrap" id="img-wrap">
+      <img id="modal-img" src="${photo.url}" alt="">
+      <div id="face-overlay" class="overlay"></div>
     </div>
     <h3 style="margin:0 0 8px">Detected faces</h3>
     <div class="modal-faces">
@@ -460,40 +515,491 @@ function renderModalBody(photo, users) {
       ${photo.faces.map(f => `
         <div class="face-row">
           <span class="name">${f.user_id ? escapeHtml(f.name) : 'Unmatched face'}</span>
-          <span class="conf">${f.confidence != null ? (f.confidence * 100).toFixed(0) + '%' : '—'} · ${f.source}</span>
+          <span class="conf">${f.confidence != null ? Number(f.confidence).toFixed(0) + '%' : '—'} · ${f.source}</span>
           <button class="remove" data-face-id="${f.id}">Remove</button>
         </div>
       `).join('')}
     </div>
-    <div class="add-tag-row">
-      <select id="add-user-select">
-        ${users.map(u => `<option value="${u.id}">${escapeHtml(u.name)}</option>`).join('')}
-      </select>
-      <button id="add-tag-btn">Add tag</button>
+    <div class="modal-add-tag">
+      <button id="enter-draw-mode" class="btn primary">+ Add manual tag</button>
+      <div id="save-panel" class="save-panel" hidden>
+        <span class="muted small">Tag this face as:</span>
+        <select id="tag-user-select">
+          ${users.map(u => `<option value="${u.id}">${escapeHtml(u.name)}</option>`).join('')}
+        </select>
+        <button id="save-tag" class="btn primary">Save tag</button>
+        <button id="cancel-tag" class="btn">Cancel</button>
+        <div id="save-error" class="error" hidden></div>
+      </div>
     </div>
   `;
+
+  // Remove handlers (existing detected faces)
   modalBody.querySelectorAll('button[data-face-id]').forEach(btn => {
     btn.addEventListener('click', async () => {
       btn.disabled = true;
-      const updated = await api(`/photos/${photo.id}/faces`, {
+      try {
+        const updated = await api(`/photos/${photo.id}/faces`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ remove_face_ids: [btn.dataset.faceId] }),
+        });
+        renderModalBody(updated, users);
+        await loadPhotos();
+      } catch (e) {
+        btn.disabled = false;
+        showToast('Remove failed: ' + parseApiError(e), 'err');
+      }
+    });
+  });
+
+  // Overlay rendering — defer until image actually has dimensions
+  const img = modalBody.querySelector('#modal-img');
+  const overlay = modalBody.querySelector('#face-overlay');
+  const layoutOverlay = () => layoutFaceOverlay(img, overlay, photo);
+  if (img.complete && img.naturalWidth > 0) layoutOverlay();
+  else img.addEventListener('load', layoutOverlay);
+
+  // ResizeObserver — handle modal resize / font-load relayout / devtools open
+  _modalState.resizeObserver = new ResizeObserver(layoutOverlay);
+  _modalState.resizeObserver.observe(img);
+
+  // Draw-mode entry
+  modalBody.querySelector('#enter-draw-mode').addEventListener('click', enterDrawMode);
+  modalBody.querySelector('#cancel-tag').addEventListener('click', cancelDraw);
+  modalBody.querySelector('#save-tag').addEventListener('click', () => submitManualTag(photo, img, overlay));
+  bindDrawHandlers(overlay);
+}
+
+function layoutFaceOverlay(img, overlay, photo) {
+  const rect = img.getBoundingClientRect();
+  // Anchor overlay over the displayed image — wrap is position:relative
+  overlay.style.width = rect.width + 'px';
+  overlay.style.height = rect.height + 'px';
+  // Wipe + redraw face boxes
+  overlay.querySelectorAll('.face-box').forEach(n => n.remove());
+  (photo.faces || []).forEach(f => {
+    if (f.bbox_space && f.bbox_space !== 'normalised') {
+      // Legacy pixel rows — silently hide (current DB has 0)
+      console.warn('skipping pixel-space face row', f.id);
+      return;
+    }
+    const [x, y, w, h] = f.bbox || [];
+    if (!Number.isFinite(x) || w <= 0 || h <= 0) return;
+    const box = document.createElement('div');
+    box.className = `face-box source-${f.source}`;
+    box.style.left = (x * rect.width) + 'px';
+    box.style.top = (y * rect.height) + 'px';
+    box.style.width = (w * rect.width) + 'px';
+    box.style.height = (h * rect.height) + 'px';
+    const nameLabel = f.user_id ? (shortName(f.name) || '?') : '?';
+    const full = (f.user_id ? f.name : 'Unmatched') + ` · ${f.source}` + (f.confidence != null ? ` · ${Number(f.confidence).toFixed(0)}%` : '');
+    box.innerHTML = `<span class="label" title="${escapeHtml(full)}">${escapeHtml(nameLabel)}</span>`;
+    overlay.appendChild(box);
+  });
+}
+
+function enterDrawMode() {
+  if (!_modalState) return;
+  _modalState.drawing = true;
+  const overlay = modalBody.querySelector('#face-overlay');
+  overlay.classList.add('drawing');
+  modalBody.querySelector('#enter-draw-mode').hidden = true;
+}
+
+function cancelDraw() {
+  if (!_modalState) return;
+  const overlay = modalBody.querySelector('#face-overlay');
+  overlay.classList.remove('drawing');
+  if (_modalState.dragRect) { _modalState.dragRect.remove(); _modalState.dragRect = null; }
+  _modalState.dragOrigin = null;
+  _modalState.drawing = false;
+  const panel = modalBody.querySelector('#save-panel');
+  if (panel) panel.hidden = true;
+  modalBody.querySelector('#enter-draw-mode').hidden = false;
+  const err = modalBody.querySelector('#save-error');
+  if (err) { err.hidden = true; err.textContent = ''; }
+}
+
+function bindDrawHandlers(overlay) {
+  overlay.addEventListener('pointerdown', e => {
+    if (!_modalState?.drawing) return;
+    e.preventDefault();
+    overlay.setPointerCapture(e.pointerId);
+    const rect = overlay.getBoundingClientRect();
+    _modalState.dragOrigin = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    // Clear previous draw-rect if any
+    if (_modalState.dragRect) _modalState.dragRect.remove();
+    const r = document.createElement('div');
+    r.className = 'draw-rect';
+    _modalState.dragRect = r;
+    overlay.appendChild(r);
+  });
+
+  overlay.addEventListener('pointermove', e => {
+    if (!_modalState?.dragOrigin) return;
+    const rect = overlay.getBoundingClientRect();
+    const cur = {
+      x: Math.max(0, Math.min(rect.width, e.clientX - rect.left)),
+      y: Math.max(0, Math.min(rect.height, e.clientY - rect.top)),
+    };
+    const o = _modalState.dragOrigin;
+    Object.assign(_modalState.dragRect.style, {
+      left: Math.min(o.x, cur.x) + 'px',
+      top: Math.min(o.y, cur.y) + 'px',
+      width: Math.abs(cur.x - o.x) + 'px',
+      height: Math.abs(cur.y - o.y) + 'px',
+    });
+  });
+
+  overlay.addEventListener('pointerup', e => {
+    if (!_modalState?.dragOrigin || !_modalState?.dragRect) return;
+    overlay.releasePointerCapture(e.pointerId);
+    const w = parseFloat(_modalState.dragRect.style.width || '0');
+    const h = parseFloat(_modalState.dragRect.style.height || '0');
+    _modalState.dragOrigin = null;
+    if (Math.hypot(w, h) < 5) {
+      // Stray click — discard
+      _modalState.dragRect.remove();
+      _modalState.dragRect = null;
+      return;
+    }
+    // Show pinned save panel
+    modalBody.querySelector('#save-panel').hidden = false;
+  });
+}
+
+async function submitManualTag(photo, img, overlay) {
+  if (!_modalState?.dragRect) return;
+  const saveBtn = modalBody.querySelector('#save-tag');
+  const saveErr = modalBody.querySelector('#save-error');
+  const userSel = modalBody.querySelector('#tag-user-select');
+  saveBtn.disabled = true;
+  saveBtn.textContent = 'Saving…';
+  saveErr.hidden = true;
+  saveErr.textContent = '';
+  const rect = overlay.getBoundingClientRect();
+  const x = parseFloat(_modalState.dragRect.style.left) / rect.width;
+  const y = parseFloat(_modalState.dragRect.style.top) / rect.height;
+  const w = parseFloat(_modalState.dragRect.style.width) / rect.width;
+  const h = parseFloat(_modalState.dragRect.style.height) / rect.height;
+  const userName = userSel.selectedOptions[0]?.textContent || 'user';
+  try {
+    const res = await api(`/photos/${photo.id}/manual-tag`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: userSel.value, bbox: [x, y, w, h] }),
+    });
+    const n = res.propagated_count;
+    showToast(`Tagged ${userName} · linked to ${n} other photo${n === 1 ? '' : 's'}`);
+    renderModalBody(res.photo, _modalState.users);
+    loadPhotos();  // async grid refresh
+  } catch (e) {
+    saveErr.textContent = parseApiError(e);
+    saveErr.hidden = false;
+    saveBtn.disabled = false;
+    saveBtn.textContent = 'Save tag';
+  }
+}
+
+// ---------- trip day · recap-photos curation ----------
+
+function _debounce(fn, ms) {
+  let t, lastArgs, hasArgs = false;
+  const wrapped = (...args) => {
+    lastArgs = args;
+    hasArgs = true;
+    clearTimeout(t);
+    t = setTimeout(() => { t = null; fn(...lastArgs); }, ms);
+  };
+  wrapped.flush = () => {
+    if (t) { clearTimeout(t); t = null; }
+    if (hasArgs) fn(...lastArgs);
+  };
+  wrapped.cancel = () => {
+    if (t) { clearTimeout(t); t = null; }
+  };
+  return wrapped;
+}
+
+let _recapState = null;  // { dayId, selectedIds: [], unselectedIds: [], byId: Map, saveAbort, sortable, lastSavedOrder }
+
+function _setRecapStatus(state, retryHandler) {
+  const el = document.getElementById('recap-photos-status');
+  if (!el) return;
+  el.className = `muted small status-${state}`;
+  if (state === 'saving') el.textContent = 'Saving…';
+  else if (state === 'saved') {
+    el.textContent = 'Saved';
+    const tag = Date.now(); el.dataset.savedTag = tag;
+    setTimeout(() => { if (el.dataset.savedTag == tag) el.textContent = ''; }, 2000);
+  } else if (state === 'failed') {
+    el.innerHTML = 'Save failed — <a href="#" class="retry">retry</a>';
+    el.style.color = 'var(--red, #c0392b)';
+    el.querySelector('.retry').addEventListener('click', (e) => {
+      e.preventDefault();
+      el.style.color = '';
+      if (retryHandler) retryHandler();
+    });
+  } else {
+    el.textContent = '';
+    el.style.color = '';
+  }
+}
+
+function _renderRecapCard(photo, selected) {
+  const cls = `photo-cell recap-card ${selected ? 'selected' : 'unselected'}`;
+  const facesHtml = (photo.faces || []).map(f => `
+    <span class="tag-chip ${f.user_id ? '' : 'unknown'}">
+      ${f.user_id ? escapeHtml(f.name || '?') : '?'}
+    </span>
+  `).join('');
+  if (selected) {
+    return `
+      <div class="${cls}" data-photo-id="${photo.id}" data-photo='${escapeHtml(JSON.stringify(photo))}'>
+        <div class="drag-handle" title="Drag to reorder">⋮⋮</div>
+        <input type="checkbox" class="photo-check recap-check" data-id="${photo.id}" checked>
+        <span class="photo-num">${photo.recap_position ?? '?'}</span>
+        <img src="${photo.url}" loading="lazy" alt="">
+        <div class="photo-tags">${facesHtml}</div>
+      </div>
+    `;
+  }
+  return `
+    <div class="${cls}" data-photo-id="${photo.id}" data-photo='${escapeHtml(JSON.stringify(photo))}'>
+      <button class="peek-icon" title="Preview" data-photo-id="${photo.id}">🔍</button>
+      <img src="${photo.url}" loading="lazy" alt="">
+      <button class="add-btn" data-id="${photo.id}">+ Add</button>
+      <div class="photo-tags">${facesHtml}</div>
+    </div>
+  `;
+}
+
+function _renumberSelected() {
+  const grid = document.getElementById('recap-selected-grid');
+  if (!grid) return;
+  grid.querySelectorAll('.photo-cell').forEach((el, i) => {
+    const b = el.querySelector('.photo-num');
+    if (b) b.textContent = i + 1;
+  });
+  const countEl = document.getElementById('recap-selected-count');
+  if (countEl) countEl.textContent = grid.querySelectorAll('.photo-cell').length;
+}
+
+function _refreshUnselectedHeader() {
+  const grid = document.getElementById('recap-unselected-grid');
+  const wrap = document.getElementById('recap-unselected-wrap');
+  if (!grid || !wrap) return;
+  const n = grid.querySelectorAll('.photo-cell').length;
+  wrap.hidden = n === 0;
+  const countEl = document.getElementById('recap-unselected-count');
+  if (countEl) countEl.textContent = n;
+}
+
+function _currentSelectedOrder() {
+  return [...document.getElementById('recap-selected-grid')
+    .querySelectorAll('.photo-cell')].map(el => el.dataset.photoId);
+}
+
+function _snapshotOrder() {
+  return _recapState ? [..._recapState.lastSavedOrder] : [];
+}
+
+function _rollbackToSnapshot() {
+  if (!_recapState || !_recapState.sortable) return;
+  _recapState.sortable.sort(_recapState.lastSavedOrder, true);
+  _renumberSelected();
+}
+
+async function initRecapPhotosSection(dayId, photos) {
+  const empty = document.getElementById('recap-photos-empty');
+  const selectedWrap = document.getElementById('recap-selected-wrap');
+  const selectedGrid = document.getElementById('recap-selected-grid');
+  const unselectedGrid = document.getElementById('recap-unselected-grid');
+
+  if (!photos.length) {
+    empty.hidden = false;
+    selectedWrap.hidden = true;
+    document.getElementById('recap-unselected-wrap').hidden = true;
+    return;
+  }
+  empty.hidden = true;
+  selectedWrap.hidden = false;
+
+  const selected = photos.filter(p => p.recap_position != null);
+  const unselected = photos.filter(p => p.recap_position == null);
+
+  selectedGrid.innerHTML = selected.map(p => _renderRecapCard(p, true)).join('');
+  unselectedGrid.innerHTML = unselected.map(p => _renderRecapCard(p, false)).join('');
+
+  _renumberSelected();
+  _refreshUnselectedHeader();
+
+  // State
+  _recapState = {
+    dayId,
+    saveAbort: null,
+    sortable: null,
+    lastSavedOrder: selected.map(p => p.id),
+  };
+
+  // Autosave (debounced) — tracks the in-flight promise so Generate can await it.
+  const _doSave = async () => {
+    if (!_recapState) return;
+    if (_recapState.saveAbort) _recapState.saveAbort.abort();
+    _recapState.saveAbort = new AbortController();
+    const ordered = _currentSelectedOrder();
+    _setRecapStatus('saving');
+    try {
+      await api(`/trip-days/${dayId}/recap-photos`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ remove_face_ids: [btn.dataset.faceId] }),
+        body: JSON.stringify({ ordered_photo_ids: ordered }),
+        signal: _recapState.saveAbort.signal,
       });
-      renderModalBody(updated, users);
-      await loadPhotos();
-    });
+      _recapState.lastSavedOrder = ordered;
+      _setRecapStatus('saved');
+    } catch (e) {
+      if (e.name === 'AbortError') return;
+      _setRecapStatus('failed', () => _saveImmediate());
+      _rollbackToSnapshot();
+    }
+  };
+  const _save = _debounce(_doSave, 600);
+
+  // Force-fire helper: cancel any pending debounce + run immediately + return promise.
+  const _saveImmediate = () => {
+    _save.cancel?.();  // cancel pending debounce if any
+    const p = _doSave();
+    if (_recapState) _recapState.lastSavePromise = p;
+    return p;
+  };
+  _recapState.saveImmediate = _saveImmediate;
+
+  // Init Sortable on selected grid
+  _recapState.sortable = new Sortable(selectedGrid, {
+    handle: '.drag-handle',
+    animation: 200,
+    ghostClass: 'card-ghost',
+    chosenClass: 'card-chosen',
+    dataIdAttr: 'data-photo-id',
+    onUpdate: () => {
+      _renumberSelected();
+      const order = _currentSelectedOrder();
+      console.log('[recap] drag end | new DOM order:', order);
+      _setRecapStatus('failed', () => { /* prompt user */ });
+      const el = document.getElementById('recap-photos-status');
+      if (el) {
+        el.textContent = 'Unsaved — click "Set order" to apply';
+        el.style.color = 'var(--red, #c0392b)';
+      }
+    },
   });
-  modalBody.querySelector('#add-tag-btn').addEventListener('click', async () => {
-    const uid = modalBody.querySelector('#add-user-select').value;
-    const updated = await api(`/photos/${photo.id}/faces`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ add: [{ user_id: uid }] }),
-    });
-    renderModalBody(updated, users);
-    await loadPhotos();
+
+  // Checkbox handlers (deselect → move card to unselected grid)
+  selectedGrid.addEventListener('change', (e) => {
+    const cb = e.target.closest('.recap-check');
+    if (!cb) return;
+    if (cb.checked) return;
+    const cell = cb.closest('.photo-cell');
+    const photo = JSON.parse(cell.dataset.photo);
+    cell.remove();
+    // Mark photo as no longer in recap, re-render as unselected card
+    photo.recap_position = null;
+    unselectedGrid.insertAdjacentHTML('beforeend', _renderRecapCard(photo, false));
+    _renumberSelected();
+    _refreshUnselectedHeader();
+    _save();
   });
+
+  // Click handlers on selected grid (modal-open + checkbox stopPropagation)
+  selectedGrid.addEventListener('click', (e) => {
+    if (e.target.closest('.photo-check') || e.target.closest('.drag-handle')) {
+      e.stopPropagation();
+      return;
+    }
+    const cell = e.target.closest('.photo-cell');
+    if (cell) openPhotoModal(JSON.parse(cell.dataset.photo));
+  });
+
+  // "+ Add" and peek handlers on unselected grid
+  unselectedGrid.addEventListener('click', (e) => {
+    const peek = e.target.closest('.peek-icon');
+    if (peek) {
+      const cell = peek.closest('.photo-cell');
+      openPhotoModal(JSON.parse(cell.dataset.photo));
+      return;
+    }
+    const addBtn = e.target.closest('.add-btn');
+    if (addBtn) {
+      const cell = addBtn.closest('.photo-cell');
+      const photo = JSON.parse(cell.dataset.photo);
+      cell.remove();
+      // Append to selected list, recap_position will be set by server
+      photo.recap_position = selectedGrid.querySelectorAll('.photo-cell').length + 1;
+      selectedGrid.insertAdjacentHTML('beforeend', _renderRecapCard(photo, true));
+      _renumberSelected();
+      _refreshUnselectedHeader();
+      _save();
+    }
+  });
+
+  // "Set order" button — explicit save of the current DOM order
+  const setOrderBtn = document.getElementById('recap-set-order');
+  if (setOrderBtn) {
+    setOrderBtn.addEventListener('click', async () => {
+      const order = _currentSelectedOrder();
+      console.log('[recap] SET ORDER clicked | sending order:', order);
+      setOrderBtn.disabled = true;
+      setOrderBtn.textContent = 'Saving…';
+      const el = document.getElementById('recap-photos-status');
+      if (el) { el.textContent = ''; el.style.color = ''; }
+      try {
+        const res = await api(`/trip-days/${dayId}/recap-photos`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ordered_photo_ids: order }),
+        });
+        console.log('[recap] SET ORDER response:', res);
+        if (_recapState) _recapState.lastSavedOrder = order;
+        _setRecapStatus('saved');
+        // Read back from server to verify
+        const day = await api(`/trip-days/${dayId}`);
+        const serverOrder = (day.photos || [])
+          .filter(p => p.recap_position != null)
+          .sort((a, b) => a.recap_position - b.recap_position)
+          .map(p => p.id);
+        console.log('[recap] SERVER ORDER after save:', serverOrder);
+        if (JSON.stringify(serverOrder) !== JSON.stringify(order)) {
+          console.error('[recap] MISMATCH! Sent vs server:', { sent: order, server: serverOrder });
+        } else {
+          console.log('[recap] ✓ Server order matches what we sent');
+        }
+      } catch (e) {
+        console.error('[recap] SET ORDER failed:', e);
+        if (el) { el.textContent = 'Save failed: ' + parseApiError(e); el.style.color = 'var(--red, #c0392b)'; }
+      } finally {
+        setOrderBtn.disabled = false;
+        setOrderBtn.textContent = '✓ Set order';
+      }
+    });
+  }
+
+  // "Add all" button
+  const addAllBtn = document.getElementById('recap-add-all');
+  if (addAllBtn) {
+    addAllBtn.addEventListener('click', () => {
+      [...unselectedGrid.querySelectorAll('.photo-cell')].forEach(cell => {
+        const photo = JSON.parse(cell.dataset.photo);
+        cell.remove();
+        photo.recap_position = selectedGrid.querySelectorAll('.photo-cell').length + 1;
+        selectedGrid.insertAdjacentHTML('beforeend', _renderRecapCard(photo, true));
+      });
+      _renumberSelected();
+      _refreshUnselectedHeader();
+      _save();
+    });
+  }
 }
 
 // ---------- trip day ----------
@@ -549,10 +1055,33 @@ async function renderTripDay(dayId) {
   } catch (_) {}
 
   document.getElementById('tday-generate-recap').addEventListener('click', async () => {
+    // Gate: must have at least one photo selected
+    const selectedCount = document
+      .getElementById('recap-selected-grid')
+      .querySelectorAll('.photo-cell').length;
+    if (selectedCount === 0) {
+      alert('Add photos to the recap before generating.');
+      return;
+    }
     const btn = document.getElementById('tday-generate-recap');
     const engine = document.getElementById('tday-engine').value;
     btn.disabled = true; btn.textContent = `Queued (${engine})…`;
     try {
+      // Log what we believe the server order should be right before generate.
+      const localOrder = _currentSelectedOrder();
+      console.log('[generate] local DOM order:', localOrder);
+      const dayBefore = await api(`/trip-days/${dayId}`);
+      const serverOrder = (dayBefore.photos || [])
+        .filter(p => p.recap_position != null)
+        .sort((a, b) => a.recap_position - b.recap_position)
+        .map(p => p.id);
+      console.log('[generate] server order (recap_position):', serverOrder);
+      if (JSON.stringify(localOrder) !== JSON.stringify(serverOrder)) {
+        console.error('[generate] ⚠️ MISMATCH — DOM differs from server. Click "Set order" first.');
+        alert('Your reorder has not been saved yet. Click "✓ Set order" first, then Generate.');
+        return;
+      }
+      console.log('[generate] ✓ DOM matches server. Submitting render with order:', serverOrder);
       await api(`/trip-days/${dayId}/generate-recap`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -560,9 +1089,12 @@ async function renderTripDay(dayId) {
       });
       await loadRenderHistory(dayId);
       startRenderPolling(dayId);
-    } catch (err) { alert('Generate failed: ' + err.message); }
+    } catch (err) { alert('Generate failed: ' + parseApiError(err)); }
     finally { btn.disabled = false; btn.textContent = '▶ Generate recap video'; }
   });
+
+  // Photos-in-recap section
+  await initRecapPhotosSection(dayId, data.photos || []);
 
   // Items table
   const tbody = document.querySelector('#tday-items tbody');
@@ -631,6 +1163,7 @@ async function loadRenderHistory(dayId) {
           <span class="pill ${statusPillClass(r.status)}" style="margin-left:8px;">${r.status.replace('_',' ')}</span>
           <span class="pill" style="margin-left:6px;background:var(--muted-bg);">${r.engine || 'shotstack'}</span>
           <div class="muted small" style="margin-top:4px;">${new Date(r.created_at).toLocaleString()}</div>
+          ${r.error ? `<div class="muted small" style="color:var(--red, #c0392b);margin-top:4px;">Error: ${escapeHtml(r.error)}</div>` : ''}
         </div>
         ${r.mp4_url ? `<video src="${r.mp4_url}" controls style="max-width:240px;border-radius:8px;"></video>` : ''}
       </div>

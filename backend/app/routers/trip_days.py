@@ -12,6 +12,7 @@ from ..models import ItineraryItem, Photo, Trip, TripDay, VideoRender
 from ..schemas import (
     ItineraryItemOut,
     ItineraryItemUpdate,
+    RecapPhotosUpdate,
     TripDayCreate,
     TripDayOut,
     TripDaySummaryOut,
@@ -185,10 +186,20 @@ def update_trip_day(
 
 @router.delete("/trip-days/{day_id}", status_code=204)
 def delete_trip_day(day_id: str, session: Session = Depends(db_session)):
+    from sqlalchemy import text as _text
     day = session.get(TripDay, day_id)
     if day is None:
         raise HTTPException(status_code=404, detail="trip_day not found")
-    session.delete(day)
+    trip_id = day.trip_id
+    session.delete(day)  # cascade deletes items; FK SET NULL on photos.itinerary_item_id
+    session.commit()
+    # Stale recap_position values on the now-orphaned photos → null them.
+    session.exec(
+        _text(
+            "UPDATE photo SET recap_position = NULL "
+            "WHERE trip_id = :tid AND itinerary_item_id IS NULL"
+        ).bindparams(tid=trip_id)
+    )
     session.commit()
 
 
@@ -214,14 +225,14 @@ def update_itinerary_item(
     if payload.importance is not None:
         item.importance = max(1, min(10, int(payload.importance)))
     session.add(item)
-    session.commit()
+    session.flush()        # write without committing — single transaction
     session.refresh(item)
 
     # Auto-rematch photos in this day so the photo counts update immediately.
     day = session.get(TripDay, item.trip_day_id)
     if day is not None:
         _rematch_photos_in_day(session, day)
-        session.commit()
+    session.commit()
 
     photo_count = len(session.exec(
         select(Photo.id).where(Photo.itinerary_item_id == item.id)
@@ -239,27 +250,154 @@ def update_itinerary_item(
     )
 
 
+@router.patch("/trip-days/{day_id}/recap-photos")
+def update_recap_photos(
+    day_id: str,
+    payload: RecapPhotosUpdate,
+    session: Session = Depends(db_session),
+):
+    """Replace-all selection + order for a day's recap photos.
+
+    Body: ``{ordered_photo_ids: [...]}``. Photos in the list get
+    ``recap_position`` assigned by index (1-based). Every other photo in this
+    day gets ``recap_position = NULL``.
+    """
+    from sqlalchemy import text as _text
+
+    import logging as _logging
+    _log = _logging.getLogger("recap-order")
+    _log.info("[PATCH /recap-photos] day=%s payload ordered_photo_ids=%s",
+              day_id, payload.ordered_photo_ids)
+
+    day = session.get(TripDay, day_id)
+    if day is None:
+        raise HTTPException(status_code=404, detail="trip_day not found")
+
+    # Collect the day's items
+    items = session.exec(
+        select(ItineraryItem.id).where(ItineraryItem.trip_day_id == day_id)
+    ).all()
+    item_ids = [i for i in items]
+    if not item_ids:
+        # No items → only valid request is an empty list
+        if payload.ordered_photo_ids:
+            raise HTTPException(
+                status_code=400,
+                detail="Day has no itinerary items — no photos can be in its recap.",
+            )
+        return {"selected": 0, "deselected": 0}
+
+    # Validate every id belongs to this day. Reject all on any mismatch.
+    if payload.ordered_photo_ids:
+        valid_ids = set(session.exec(
+            select(Photo.id).where(
+                Photo.id.in_(payload.ordered_photo_ids),  # type: ignore[attr-defined]
+                Photo.itinerary_item_id.in_(item_ids),  # type: ignore[attr-defined]
+            )
+        ).all())
+        invalid = [pid for pid in payload.ordered_photo_ids if pid not in valid_ids]
+        if invalid:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Photos no longer in this day: {invalid}. Refresh the page.",
+            )
+
+    # Apply replace-all in a single transaction.
+    if payload.ordered_photo_ids:
+        # 1) Set recap_position for selected ids — one round-trip per photo.
+        #    Could use a single VALUES round-trip; PoC volume makes this trivial.
+        for idx, pid in enumerate(payload.ordered_photo_ids, start=1):
+            p = session.get(Photo, pid)
+            if p is not None:
+                p.recap_position = idx
+                session.add(p)
+
+    # 2) NULL out everything else in this day.
+    keep_ids = set(payload.ordered_photo_ids)
+    others = session.exec(
+        select(Photo).where(
+            Photo.itinerary_item_id.in_(item_ids),  # type: ignore[attr-defined]
+            Photo.recap_position.is_not(None),  # type: ignore[attr-defined]
+        )
+    ).all()
+    for p in others:
+        if p.id not in keep_ids:
+            p.recap_position = None
+            session.add(p)
+    session.commit()
+
+    # Count for response
+    selected = len(payload.ordered_photo_ids)
+    total = session.exec(
+        select(Photo.id).where(Photo.itinerary_item_id.in_(item_ids))  # type: ignore[attr-defined]
+    ).all()
+    deselected = len(total) - selected
+
+    # Verbose verification log: read back recap_position state
+    verify = session.exec(
+        select(Photo.id, Photo.recap_position)
+        .where(Photo.itinerary_item_id.in_(item_ids))  # type: ignore[attr-defined]
+        .order_by(Photo.recap_position.asc().nulls_last())  # type: ignore[attr-defined]
+    ).all()
+    _log.info(
+        "[PATCH /recap-photos] day=%s after-save state (id, recap_position): %s",
+        day_id, [(pid[:8], pos) for pid, pos in verify],
+    )
+    return {"selected": selected, "deselected": deselected}
+
+
 # ---------- helpers ----------
 
 def _rematch_photos_in_day(session: Session, day: TripDay) -> int:
     """For photos in this trip whose taken_at date matches this day's date,
-    re-assign itinerary_item_id."""
+    re-assign itinerary_item_id. Preserves admin's recap curation:
+
+    - Same-day item swap → recap_position untouched (drag order stays).
+    - Photo joining the day for the first time (old_iid was None) → recap_position
+      set to max+1 (appended).
+    - Photo falling out of all items in this day → itinerary_item_id + recap_position
+      both NULLed.
+    """
+    from sqlalchemy import text as _text  # local import to keep file's top tidy
     photos = session.exec(
         select(Photo).where(Photo.trip_id == day.trip_id, Photo.taken_at.is_not(None))  # type: ignore[attr-defined]
     ).all()
     matched = 0
+    new_day_max: int | None = None  # cache; populated on first "new entrant"
     for p in photos:
         if not p.taken_at or p.taken_at.date() != day.date:
             continue
-        item_id = match_to_itinerary(session, trip_id=day.trip_id, taken_at=p.taken_at)
-        if item_id and p.itinerary_item_id != item_id:
-            p.itinerary_item_id = item_id
-            session.add(p)
-            matched += 1
+        old_iid = p.itinerary_item_id
+        new_iid = match_to_itinerary(session, trip_id=day.trip_id, taken_at=p.taken_at)
+        if new_iid == old_iid:
+            continue
+        if new_iid is None:
+            # Photo no longer fits any item in this day → drop from recap.
+            p.itinerary_item_id = None
+            p.recap_position = None
+        else:
+            p.itinerary_item_id = new_iid
+            if old_iid is None:
+                # Photo joining the day for the first time → append.
+                if new_day_max is None:
+                    new_day_max = session.exec(
+                        _text(
+                            "SELECT COALESCE(MAX(p.recap_position), 0) "
+                            "FROM photo p JOIN itinerary_item ii ON ii.id = p.itinerary_item_id "
+                            "WHERE ii.trip_day_id = :did"
+                        ).bindparams(did=day.id)
+                    ).scalar() or 0
+                new_day_max += 1
+                p.recap_position = new_day_max
+            # else: same-day swap → recap_position preserved.
+        session.add(p)
+        matched += 1
     return matched
 
 
 def _day_to_out(session: Session, day: TripDay) -> TripDayOut:
+    from ..models import PhotoFace, User
+    from .photos import _photo_to_out
     storage = get_storage()
 
     items = session.exec(
@@ -267,15 +405,55 @@ def _day_to_out(session: Session, day: TripDay) -> TripDayOut:
         .where(ItineraryItem.trip_day_id == day.id)
         .order_by(ItineraryItem.position)  # type: ignore[arg-type]
     ).all()
+    item_ids = [i.id for i in items]
 
-    item_counts: dict[str, int] = {}
-    photo_count = 0
-    for i in items:
-        n = len(session.exec(
-            select(Photo.id).where(Photo.itinerary_item_id == i.id)
+    # Per-item photo counts (used in items_out)
+    item_counts: dict[str, int] = {i.id: 0 for i in items}
+
+    # Photos for this day — selected first by recap_position, then unselected (NULLS LAST)
+    photos: list[Photo] = []
+    if item_ids:
+        photos = list(session.exec(
+            select(Photo)
+            .where(Photo.itinerary_item_id.in_(item_ids))  # type: ignore[attr-defined]
+            .order_by(
+                Photo.recap_position.asc().nulls_last(),  # type: ignore[attr-defined]
+                Photo.taken_at,
+                Photo.id,
+            )
         ).all())
-        item_counts[i.id] = n
-        photo_count += n
+    for p in photos:
+        item_counts[p.itinerary_item_id] = item_counts.get(p.itinerary_item_id, 0) + 1
+    photo_count = sum(item_counts.values())
+
+    # Batched face fetch (one query, group in Python)
+    photo_ids = [p.id for p in photos]
+    face_rows: list[PhotoFace] = []
+    if photo_ids:
+        face_rows = list(session.exec(
+            select(PhotoFace).where(
+                PhotoFace.photo_id.in_(photo_ids),  # type: ignore[attr-defined]
+                PhotoFace.removed == False,  # noqa: E712
+            )
+        ).all())
+    faces_by_photo: dict[str, list[PhotoFace]] = {}
+    for f in face_rows:
+        faces_by_photo.setdefault(f.photo_id, []).append(f)
+
+    # Users named in faces — single fetch
+    user_ids = {f.user_id for f in face_rows if f.user_id}
+    users_by_id: dict[str, User] = {}
+    if user_ids:
+        users_by_id = {
+            u.id: u for u in session.exec(
+                select(User).where(User.id.in_(list(user_ids)))  # type: ignore[attr-defined]
+            ).all()
+        }
+
+    photos_out = [
+        _photo_to_out(p, faces_by_photo.get(p.id, []), users_by_id, storage)
+        for p in photos
+    ]
 
     items_out = [
         ItineraryItemOut(
@@ -287,7 +465,7 @@ def _day_to_out(session: Session, day: TripDay) -> TripDayOut:
             description=i.description,
             caption=i.caption,
             importance=i.importance,
-            photo_count=item_counts[i.id],
+            photo_count=item_counts.get(i.id, 0),
         )
         for i in items
     ]
@@ -309,6 +487,7 @@ def _day_to_out(session: Session, day: TripDay) -> TripDayOut:
                      if latest_render.mp4_storage_path else None),
             duration_seconds=latest_render.duration_seconds,
             admin_notes=latest_render.admin_notes,
+            error=latest_render.error,
             created_at=latest_render.created_at,
             reviewed_at=latest_render.reviewed_at,
         )
@@ -330,6 +509,7 @@ def _day_to_out(session: Session, day: TripDay) -> TripDayOut:
         voiceover_script=day.voiceover_script,
         filmable_moments=moments,
         items=items_out,
+        photos=photos_out,
         photo_count=photo_count,
         latest_video=latest_out,
     )

@@ -71,13 +71,25 @@ async def _run(video_render_id: str) -> None:
             .where(ItineraryItem.trip_day_id == day.id)
             .order_by(ItineraryItem.position)  # type: ignore[arg-type]
         ).all()
-        photos = s.exec(
-            select(Photo).where(Photo.trip_id == day.trip_id, Photo.itinerary_item_id.is_not(None))  # type: ignore[attr-defined]
-        ).all()
         item_ids = {i.id for i in items}
-        photos = [p for p in photos if p.itinerary_item_id in item_ids and (p.taken_at is not None)]
+        photos = list(s.exec(
+            select(Photo)
+            .where(
+                Photo.trip_id == day.trip_id,
+                Photo.itinerary_item_id.in_(item_ids) if item_ids else False,  # type: ignore[attr-defined]
+                Photo.recap_position.is_not(None),  # type: ignore[attr-defined]
+            )
+            .order_by(Photo.recap_position)  # type: ignore[arg-type]
+        ).all())
+        log.info(
+            "[recap %s] photo fetch (in recap_position order): %s",
+            video_render_id,
+            [(p.id[:8], p.recap_position) for p in photos],
+        )
         if not photos:
-            raise RuntimeError("no photos with itinerary_item_id matched to this day — upload + match first")
+            raise RuntimeError(
+                "No photos selected for this day's recap. Open the day in admin and pick some."
+            )
 
         engine = (vr.engine or "shotstack").lower()
         version = vr.version
@@ -85,9 +97,11 @@ async def _run(video_render_id: str) -> None:
 
     # ---------- 2. TTS with word timings (shared by both engines) ----------
     log.info("[recap %s] tts: %d chars (engine=%s)", video_render_id, len(script_text), engine)
-    mp3_bytes, word_timings = tts.synthesize_with_timing(script_text)
-    voiceover_key = f"voiceovers/{day.id}/v{version}.mp3"
-    await storage.put(voiceover_key, mp3_bytes, "audio/mpeg")
+    audio_bytes, word_timings = tts.synthesize_with_timing(script_text)
+    # Format-aware upload — gemini returns WAV, elevenlabs returns MP3.
+    audio_ext, audio_mime = audio_probe.audio_ext_and_mime(audio_bytes)
+    voiceover_key = f"voiceovers/{day.id}/v{version}.{audio_ext}"
+    await storage.put(voiceover_key, audio_bytes, audio_mime)
     voiceover_url = storage.public_url(voiceover_key)
 
     # Save timing.json alongside the MP3 (used by LiveCaption in Remotion).
@@ -106,7 +120,7 @@ async def _run(video_render_id: str) -> None:
         log.info("[recap %s] no word timings (TTS endpoint unavailable); captions disabled", video_render_id)
 
     # Probe voiceover duration so the video matches the audio length.
-    voice_secs = audio_probe.mp3_duration_seconds(mp3_bytes) or TARGET_SECONDS
+    voice_secs = audio_probe.audio_duration_seconds(audio_bytes) or TARGET_SECONDS
     log.info("[recap %s] voiceover_secs=%.2f", video_render_id, voice_secs)
 
     with session_scope() as s:
@@ -118,12 +132,14 @@ async def _run(video_render_id: str) -> None:
             s.commit()
 
     # ---------- 3. Dispatch to chosen engine ----------
+    # photos is already in admin's chosen recap_position order. Group by item
+    # WITHOUT re-sorting — preserving admin's flat order means item-N's title
+    # card (Shotstack path) appears at the global position where item-N's
+    # first photo lands, which is intentional.
     photos_by_item: dict[str, list[Photo]] = {i.id: [] for i in items}
     for p in photos:
         assert p.itinerary_item_id
         photos_by_item.setdefault(p.itinerary_item_id, []).append(p)
-    for lst in photos_by_item.values():
-        lst.sort(key=lambda x: x.taken_at or datetime.min.replace(tzinfo=timezone.utc))
 
     if engine == "remotion":
         mp4_bytes = await _render_via_remotion(
@@ -198,10 +214,14 @@ async def _render_via_remotion(
     """Remotion pipeline: POST spec to Node renderer → receive MP4 bytes."""
     item_by_id = {i.id: i for i in items}
 
-    # Order photos: by item position, then by taken_at within each item.
-    ordered: list[Photo] = []
-    for item in sorted(items, key=lambda i: i.position):
-        ordered.extend(photos_by_item.get(item.id, []))
+    # photos is already in admin's chosen recap_position order — use it directly.
+    # (Don't re-group by item.position — that would clobber admin's drag order.)
+    ordered: list[Photo] = list(photos)
+    log.info(
+        "[recap %s] ordered for Remotion: %s",
+        video_render_id,
+        [(p.id[:8], p.recap_position) for p in ordered],
+    )
 
     photo_specs = []
     for p in ordered:
@@ -255,6 +275,11 @@ async def _render_via_remotion(
         )
 
     log.info("[recap %s] submitting to Remotion renderer (%d photos)", video_render_id, len(photo_specs))
+    log.info(
+        "[recap %s] spec.photos URLs (in order): %s",
+        video_render_id,
+        [ps["url"].rsplit("/", 1)[-1] for ps in photo_specs],
+    )
     import asyncio
     mp4_bytes = await asyncio.to_thread(remotion.render, spec)
     log.info("[recap %s] Remotion returned %d bytes", video_render_id, len(mp4_bytes))
