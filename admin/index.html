@@ -177,6 +177,19 @@
         <span class="muted small" id="tday-script-status"></span>
         <button id="tday-save-script" class="ghost">Save script</button>
       </div>
+
+      <div class="ai-edit-panel" style="margin-top:16px;padding:12px;border:1px dashed var(--border);border-radius:10px;background:#fafafa;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+          <strong style="font-size:14px;">Edit with AI</strong>
+          <span class="muted small" id="tday-ai-target">—</span>
+        </div>
+        <p class="muted small" style="margin:0 0 8px;">Tell Gemini what to change — e.g. "talk about the palace first", "make it shorter", "more about the food". Duration scales with the number of selected photos.</p>
+        <textarea id="tday-ai-instructions" rows="2" class="textarea-clean" placeholder="What should change?"></textarea>
+        <div class="form-actions" style="margin-top:8px;">
+          <span class="muted small" id="tday-ai-status"></span>
+          <button id="tday-ai-apply" class="primary">Apply with AI</button>
+        </div>
+      </div>
     </div>
 
     <!-- 3 · Photos in recap -->

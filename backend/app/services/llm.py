@@ -81,6 +81,62 @@ def _client():
     return genai.GenerativeModel("gemini-2.0-flash")
 
 
+_EDIT_PROMPT = """You are rewriting a voiceover script for a daily recap video for an Indian senior-traveller tour.
+
+CURRENT SCRIPT:
+---
+{current_script}
+---
+
+Admin's instructions for the rewrite:
+---
+{instructions}
+---
+
+Constraints:
+- Target length: ~{target_words} words (this will play in ~{target_seconds} seconds at gentle pace).
+- Tone: warm, personal, first-person plural ("we"), past tense. NO exclamation marks.
+  No promotional energy ("amazing", "incredible", "you won't believe").
+- Suitable for a 65+ Indian audience.
+- Preserve the facts in the current script unless the admin explicitly asks to drop/add.
+- Output ONLY the rewritten script as plain text. No JSON, no markdown fences, no commentary.
+"""
+
+
+def edit_voiceover_script(
+    current_script: str, instructions: str, target_seconds: int
+) -> str:
+    """Rewrite a recap voiceover with admin's instructions + target duration.
+
+    target_seconds drives length via roughly 2 words/second (gentle pace).
+    """
+    if not (current_script or "").strip():
+        raise LLMError("current_script is empty — generate the script first")
+    if not (instructions or "").strip():
+        raise LLMError("instructions are empty")
+    target_seconds = max(5, min(180, int(target_seconds)))
+    target_words = max(10, target_seconds * 2)
+    model = _client()
+    prompt = _EDIT_PROMPT.format(
+        current_script=current_script.strip(),
+        instructions=instructions.strip(),
+        target_seconds=target_seconds,
+        target_words=target_words,
+    )
+    resp = model.generate_content(
+        prompt,
+        generation_config={"temperature": 0.7},
+    )
+    text = (resp.text or "").strip()
+    # Strip code fences if Gemini added them despite the instruction
+    text = text.removeprefix("```").removesuffix("```").strip()
+    if text.startswith("text\n"):
+        text = text[5:].strip()
+    if not text:
+        raise LLMError("Gemini returned empty text for script edit")
+    return text
+
+
 def structure_itinerary(raw_text: str, day_date: date_type) -> dict:
     """Sends raw TM text to Gemini, returns a dict matching the schema in _PROMPT."""
     if not raw_text.strip():

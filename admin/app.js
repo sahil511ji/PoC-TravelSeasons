@@ -1040,6 +1040,38 @@ async function renderTripDay(dayId) {
     finally { btn.disabled = false; btn.textContent = 'Save script'; }
   });
 
+  // AI script-edit panel — target duration scales with selected-photo count.
+  const aiTarget = document.getElementById('tday-ai-target');
+  const aiInput = document.getElementById('tday-ai-instructions');
+  const aiBtn = document.getElementById('tday-ai-apply');
+  const aiStatus = document.getElementById('tday-ai-status');
+  const refreshAiTarget = () => {
+    const n = (data.photos || []).filter(p => p.recap_position != null).length;
+    const secs = Math.max(15, (n || 10) * 3);  // 3s/photo, min 15s
+    aiTarget.textContent = `${n} photo${n === 1 ? '' : 's'} selected · target ~${secs}s`;
+  };
+  refreshAiTarget();
+  aiBtn.addEventListener('click', async () => {
+    const instructions = aiInput.value.trim();
+    if (!instructions) { aiStatus.textContent = 'Type instructions first.'; return; }
+    aiBtn.disabled = true; aiBtn.textContent = 'Editing…'; aiStatus.textContent = '';
+    try {
+      const resp = await api(`/trip-days/${dayId}/edit-script-ai`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ instructions }),
+      });
+      scriptArea.value = resp.voiceover_script || '';
+      aiInput.value = '';
+      aiStatus.textContent = `Updated (${resp.photo_count} photos · ${resp.target_seconds}s target).`;
+      setTimeout(() => { aiStatus.textContent = ''; }, 4000);
+    } catch (err) {
+      aiStatus.textContent = 'AI edit failed: ' + (err.message || err);
+    } finally {
+      aiBtn.disabled = false; aiBtn.textContent = 'Apply with AI';
+    }
+  });
+
   // Disable Remotion option if renderer offline
   try {
     const rh = await api('/health/renderer');

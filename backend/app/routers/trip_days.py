@@ -20,7 +20,9 @@ from ..schemas import (
     VideoRenderOut,
 )
 from ..services.exif import match_to_itinerary
-from ..services.llm import LLMError, structure_itinerary
+from ..services.llm import LLMError, edit_voiceover_script, structure_itinerary
+
+SECONDS_PER_PHOTO = 3  # admin-chosen pacing: ~3s of voiceover per selected photo
 
 router = APIRouter(tags=["trip_days"])
 
@@ -182,6 +184,60 @@ def update_trip_day(
     session.commit()
     session.refresh(day)
     return _day_to_out(session, day)
+
+
+@router.post("/trip-days/{day_id}/edit-script-ai")
+def edit_script_ai(
+    day_id: str, payload: dict, session: Session = Depends(db_session)
+):
+    """Rewrite the day's voiceover_script via Gemini, given admin instructions.
+
+    Target duration is derived from the number of currently-selected photos
+    (recap_position IS NOT NULL) at SECONDS_PER_PHOTO seconds each. AI only sees
+    the existing script + the admin's instructions + the target word count —
+    it does NOT see per-photo metadata.
+    """
+    day = session.get(TripDay, day_id)
+    if day is None:
+        raise HTTPException(status_code=404, detail="trip_day not found")
+    instructions = (payload or {}).get("instructions", "").strip()
+    if not instructions:
+        raise HTTPException(status_code=400, detail="instructions are required")
+    if not (day.voiceover_script or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="day has no voiceover_script yet — generate it first",
+        )
+
+    photo_count = session.exec(
+        select(Photo.id)
+        .join(ItineraryItem, ItineraryItem.id == Photo.itinerary_item_id)
+        .where(
+            ItineraryItem.trip_day_id == day_id,
+            Photo.recap_position.is_not(None),  # type: ignore[attr-defined]
+        )
+    ).all()
+    n_photos = len(photo_count)
+    # If zero photos selected, fall back to a 30s default so AI still produces useful output.
+    target_seconds = max(15, n_photos * SECONDS_PER_PHOTO) if n_photos else 30
+
+    try:
+        new_script = edit_voiceover_script(
+            day.voiceover_script, instructions, target_seconds
+        )
+    except LLMError as e:
+        raise HTTPException(status_code=502, detail=f"Gemini edit failed: {e}") from e
+
+    day.voiceover_script = new_script
+    session.add(day)
+    session.commit()
+    session.refresh(day)
+    return {
+        "voiceover_script": new_script,
+        "photo_count": n_photos,
+        "target_seconds": target_seconds,
+        "target_words": target_seconds * 2,
+    }
 
 
 @router.delete("/trip-days/{day_id}", status_code=204)
