@@ -356,6 +356,37 @@ class AwsFaceEngine:
             return None
         return face_records[0]["Face"]["FaceId"]
 
+    def find_existing_user_for_selfie(
+        self, image_bytes: bytes, min_similarity: float = 80.0
+    ) -> tuple[str | None, float]:
+        """Search the collection for an already-enrolled user whose face matches this selfie.
+
+        Returns ``(user_id, similarity)`` when the best non-``unmatched:`` match
+        clears ``min_similarity``; ``(None, 0.0)`` otherwise. Used by the
+        enrollment endpoint to auto-merge a fresh Flutter enrollment into an
+        existing admin-pre-tagged user instead of creating a duplicate account.
+        """
+        image_bytes = resize_if_oversized(image_bytes)
+        try:
+            resp = self._client.search_faces_by_image(
+                CollectionId=self._collection_id,
+                Image={"Bytes": image_bytes},
+                MaxFaces=10,
+                FaceMatchThreshold=min_similarity,
+                QualityFilter="NONE",
+            )
+        except self._client.exceptions.InvalidParameterException:
+            return None, 0.0
+        except ClientError as e:
+            log.warning("find_existing_user_for_selfie failed: %s", e)
+            return None, 0.0
+        for m in resp.get("FaceMatches", []) or []:
+            face = m.get("Face", {})
+            eid = face.get("ExternalImageId") or ""
+            if eid and not eid.startswith("unmatched:"):
+                return eid, float(m.get("Similarity", 0))
+        return None, 0.0
+
     def search_unmatched_for_user(
         self, user_face_id: str, caller_user_id: str | None = None
     ) -> list[tuple[str, str, float]]:

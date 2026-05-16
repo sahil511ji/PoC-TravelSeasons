@@ -38,6 +38,44 @@ async def create_enrollment(
 
     # Re-enrolment path: if user already has an AWS face_id, delete the old one first.
     existing = session.get(User, user_id) if user_id else None
+
+    # Auto-merge: if this is a fresh enrollment (no existing user row for this
+    # user_id) AND the selfie matches an already-enrolled user at >=80%, treat
+    # the enrolment as a login for that user instead of creating a duplicate.
+    # Covers the common flow: admin pre-tags photos to create user X; later the
+    # real X opens the Flutter app and uploads their selfie.
+    if existing is None:
+        matched_user_id, matched_sim = await asyncio.to_thread(
+            eng.find_existing_user_for_selfie, image_bytes
+        )
+        if matched_user_id:
+            candidate = session.get(User, matched_user_id)
+            if candidate and candidate.deleted_at is None:
+                log.info(
+                    "enrollment auto-merge: selfie matched existing user_id=%s name=%r similarity=%.1f",
+                    candidate.id, candidate.name, matched_sim,
+                )
+                # Update display name/email if caller provided them.
+                if name:
+                    candidate.name = name
+                if email is not None:
+                    candidate.email = email
+                # Save the selfie file under the existing user's id.
+                selfie_key = f"selfies/{candidate.id}.jpg"
+                await storage.put(selfie_key, image_bytes, selfie.content_type or "image/jpeg")
+                candidate.selfie_path = selfie_key
+                session.add(candidate)
+                session.commit()
+                session.refresh(candidate)
+                return UserOut(
+                    id=candidate.id,
+                    name=candidate.name,
+                    email=candidate.email,
+                    has_selfie=candidate.selfie_path is not None,
+                    selfie_url=storage.public_url(candidate.selfie_path) if candidate.selfie_path else None,
+                    created_at=candidate.created_at,
+                )
+
     if existing and existing.rekognition_face_id:
         try:
             await asyncio.to_thread(eng.delete_face, existing.rekognition_face_id)

@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlmodel import Session, select, update
+from sqlmodel import Session, select
 
 from ..deps import db_session, get_storage
-from ..face import get_engine
-from ..models import PhotoFace, User
+from ..face import crop_face, get_engine
+from ..models import Photo, PhotoFace, User
 from ..schemas import UserOut
 
 log = logging.getLogger(__name__)
@@ -47,8 +48,56 @@ async def delete_user(user_id: str, session: Session = Depends(db_session)):
         except Exception:
             log.warning("delete selfie file failed (non-fatal)", exc_info=True)
 
+    # Release this user's auto/manual face tags back to the "unmatched" pool BEFORE
+    # we delete their AWS faces. Each row's bbox is re-cropped from the source photo
+    # and re-indexed with ExternalImageId='unmatched:<pf_id>' so a future enrolment
+    # can rediscover it. Without this, auto-matched faces become invisible after
+    # delete because their AWS anchor (the user's selfie face) is about to vanish.
+    pf_rows = session.exec(
+        select(PhotoFace).where(PhotoFace.user_id == user_id, PhotoFace.removed == False)  # noqa: E712
+    ).all()
+    released = 0
+    dropped = 0
+    if pf_rows:
+        eng = get_engine()
+        photo_bytes_cache: dict[str, bytes] = {}
+        for pf in pf_rows:
+            photo = session.get(Photo, pf.photo_id)
+            if photo is None:
+                dropped += 1
+                pf.removed = True
+                session.add(pf)
+                continue
+            try:
+                img_bytes = photo_bytes_cache.get(photo.storage_path)
+                if img_bytes is None:
+                    img_bytes = await storage.get_bytes(photo.storage_path)
+                    photo_bytes_cache[photo.storage_path] = img_bytes
+                bbox = json.loads(pf.bbox)
+                crop_bytes, crop_err = crop_face(img_bytes, bbox)
+                if not crop_bytes:
+                    raise RuntimeError(f"crop failed: {crop_err}")
+                new_face_id = await asyncio.to_thread(eng.index_unmatched, crop_bytes, pf.id)
+                if not new_face_id:
+                    raise RuntimeError("index_unmatched returned None (quality reject)")
+                pf.user_id = None
+                pf.rekognition_face_id = new_face_id
+                pf.confidence = None
+                pf.source = "auto"
+                pf.removed = False
+                pf.error = None
+                session.add(pf)
+                released += 1
+            except Exception:
+                log.warning("release_face_to_unmatched failed pf=%s photo=%s", pf.id, pf.photo_id, exc_info=True)
+                pf.removed = True
+                session.add(pf)
+                dropped += 1
+        log.info("delete_user user=%s released=%d dropped=%d", user_id, released, dropped)
+
     # Remove ALL of the user's faces from the Rekognition collection (canonical
-    # selfie + any manual-tag face_ids added later via /manual-tag).
+    # selfie + any manual-tag face_ids added later via /manual-tag). The released
+    # rows above now reference NEW unmatched: face entries, not these.
     if user.rekognition_face_id is not None:
         try:
             face_ids = await asyncio.to_thread(get_engine().list_user_face_ids, user_id)
@@ -69,10 +118,5 @@ async def delete_user(user_id: str, session: Session = Depends(db_session)):
     user.selfie_path = None
     user.deleted_at = datetime.now(timezone.utc)
     session.add(user)
-
-    # Mark all face tags pointing at this user as removed.
-    session.exec(
-        update(PhotoFace).where(PhotoFace.user_id == user_id).values(removed=True)
-    )
     session.commit()
     return

@@ -36,13 +36,12 @@ function shortName(s) {
   return parts[0].slice(0, 12);
 }
 
-// Cache /users across modal opens; invalidate on user CRUD.
-let _usersCache = null;
+// /users is cheap and users can be enrolled out-of-band via Flutter; always
+// fetch fresh so the manual-tag dropdown reflects the current set.
 async function getUsers() {
-  if (_usersCache === null) _usersCache = await api('/users');
-  return _usersCache;
+  return await api('/users');
 }
-function invalidateUsersCache() { _usersCache = null; }
+function invalidateUsersCache() { /* no-op — kept for callers */ }
 
 // Parse FastAPI's {"detail": "..."} out of api() throws.
 function parseApiError(e) {
